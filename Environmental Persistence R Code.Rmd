@@ -1,0 +1,4896 @@
+---
+title: "Persistence Analyses"
+author: "McCaide Wooten"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+---
+# Load Data
+```{r Load Data, cache=FALSE}
+
+library(readxl)
+library(tinytex)
+
+dat <- read_excel("C:/INSERT FILE PATHWAY HERE/Environmental Persistence Data.xlsx", sheet = "Samples")
+
+```
+
+
+# Survival Analysis
+## Setup & Basic Stats
+```{r Survival Analysis:Setup & Basic Stats, cache=FALSE}
+
+library(tidyverse)
+library(janitor)
+library(dplyr)
+library(survival)
+library(stringr)
+library(ggplot2)
+library(Icens)
+library(tibble)
+
+# How many carcass sites have a known date/year of death? #
+
+known_death <- dat %>%
+  filter(site_id != "WOLF-23-01") %>%
+  filter(carcass_id != "WOLF-23-01") %>%
+  filter(carcass_association == "Y", !is.na(year_of_death))
+
+known_death_summary <- known_death %>%
+  summarise(
+    n_rows = n(),
+    n_carcass_id = n_distinct(carcass_id),
+    n_site_id = n_distinct(site_id)
+  )
+
+known_death_summary
+
+# Distribution of death year (unique carcass_id only) #
+known_death %>%
+  distinct(carcass_id, year_of_death) %>%
+  count(year_of_death, sort = TRUE)
+
+# Among known-death sites, how many have paired soil and tissue over the entire study? What is the censoring-type distribution for these soil and tissue samples? #
+
+kd_st <- known_death %>%
+  filter(substrate %in% c("Soil", "Tissue"),
+         !is.na(culture_ac_pos),
+         !is.na(time_since_death_years)) %>%
+  mutate(
+    pos = (culture_ac_pos == "Y")
+  )
+
+paired_status <- kd_st %>%
+  distinct(carcass_id, substrate) %>%
+  count(carcass_id, name = "n_substrates") %>%
+  mutate(paired_soil_tissue = (n_substrates == 2))
+
+paired_status %>%
+  summarise(
+    n_known_death_carcass = n(),
+    n_paired = sum(paired_soil_tissue),
+    n_unpaired = sum(!paired_soil_tissue)
+  )
+
+# List unpaired carcass_ids + which substrate they have
+unpaired_list <- kd_st %>%
+  distinct(carcass_id, substrate) %>%
+  group_by(carcass_id) %>%
+  summarise(substrates_present = paste(sort(unique(substrate)), collapse = ", "),
+            .groups = "drop") %>%
+  left_join(paired_status, by = "carcass_id") %>%
+  filter(!paired_soil_tissue)
+
+unpaired_list
+
+# Censoring type per carcass_id × substrate
+# Definition:
+# left  = never culture positive
+# right = culture positive at most recent observation
+# interval = positive at some point, then negative later
+
+# collapse to one "visit" per carcass_id × substrate × time_since_death_years
+visits <- kd_st %>%
+  group_by(carcass_id, substrate, time_since_death_years) %>%
+  summarise(
+    pos = any(pos, na.rm = TRUE),
+    sample_year = min(sample_year, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+censor_types <- visits %>%
+  arrange(carcass_id, substrate, time_since_death_years) %>%
+  group_by(carcass_id, substrate) %>%
+  summarise(
+    any_pos = any(pos),
+    last_status = dplyr::last(pos),
+    censor_type = case_when(
+      !any_pos ~ "left",
+      last_status ~ "right",
+      TRUE ~ "interval"
+    ),
+    .groups = "drop"
+  )
+
+# Distribution overall
+censor_types %>%
+  count(censor_type) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  arrange(match(censor_type, c("left", "interval", "right")))
+
+# Distribution by substrate
+censor_types %>%
+  count(substrate, censor_type) %>%
+  group_by(substrate) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ungroup() %>%
+  arrange(substrate, match(censor_type, c("left", "interval", "right")))
+
+# Wide Table
+censor_types %>%
+  count(substrate, censor_type) %>%
+  tidyr::pivot_wider(names_from = censor_type, values_from = n, values_fill = 0)
+
+# Censoring distribution ONLY among paired carcasses
+paired_ids <- paired_status %>%
+  filter(paired_soil_tissue) %>%
+  pull(carcass_id)
+
+censor_types %>%
+  filter(carcass_id %in% paired_ids) %>%
+  count(substrate, censor_type) %>%
+  group_by(substrate) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ungroup() %>%
+  arrange(substrate, match(censor_type, c("left", "interval", "right")))
+
+censor_types %>%
+  filter(carcass_id %in% paired_ids) %>%
+  count(substrate, censor_type) %>%
+  tidyr::pivot_wider(names_from = censor_type, values_from = n, values_fill = 0)
+
+# Identify left-censored carcass×substrate series (paired only) #
+left_series <- censor_types %>%
+  filter(carcass_id %in% paired_ids, censor_type == "left") %>%
+  dplyr::select(carcass_id, substrate)
+
+# Pull only visits that belong to left-censored series
+left_visits <- visits %>%
+  semi_join(left_series, by = c("carcass_id", "substrate"))
+
+# Visit-level summary: distribution of observed sampling times (pooled across sites) #
+summ_stats <- function(x) {
+  tibble(
+    n = sum(!is.na(x)),
+    min = min(x, na.rm = TRUE),
+    q1 = as.numeric(quantile(x, 0.25, na.rm = TRUE)),
+    median = median(x, na.rm = TRUE),
+    mean = mean(x, na.rm = TRUE),
+    q3 = as.numeric(quantile(x, 0.75, na.rm = TRUE)),
+    max = max(x, na.rm = TRUE)
+  )
+}
+
+left_visit_summary_by_substrate <- left_visits %>%
+  group_by(substrate) %>%
+  summarise(summ_stats(time_since_death_years), .groups = "drop")
+
+left_visit_summary_by_substrate
+
+# Carcass-series summary: per carcass_id×substrate, what was the sampling window? #
+left_series_windows <- left_visits %>%
+  group_by(carcass_id, substrate) %>%
+  summarise(
+    n_visits = n(),
+    first_tsd = min(time_since_death_years, na.rm = TRUE),
+    last_tsd  = max(time_since_death_years, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Summarize those windows across carcasses, by substrate
+left_window_summary_by_substrate <- left_series_windows %>%
+  group_by(substrate) %>%
+  summarise(
+    n_series = n(),
+    median_first = median(first_tsd, na.rm = TRUE),
+    median_last  = median(last_tsd,  na.rm = TRUE),
+    min_first = min(first_tsd, na.rm = TRUE),
+    max_last  = max(last_tsd,  na.rm = TRUE),
+    .groups = "drop"
+  )
+
+left_window_summary_by_substrate
+
+left_series_windows %>%
+  arrange(substrate, last_tsd)
+
+##############################
+# Generation of Table 1 Data #
+##############################
+
+tab_dat <- dat %>%
+  filter(
+    coalesce(as.character(site_id), "") != "WOLF-23-01",
+    coalesce(as.character(carcass_id), "") != "WOLF-23-01"
+  )
+
+sample_types <- c("Tissue", "Soil", "Water", "Sediment", "Vegetation")
+
+tab_dat <- dat %>%
+  mutate(
+    unique_id = as.character(unique_id),
+    site_id = as.character(site_id),
+    carcass_id = as.character(carcass_id),
+    species = as.character(species),
+    carcass_association = as.character(carcass_association),
+    substrate = as.character(substrate),
+    sample_type = substrate
+  ) %>%
+  filter(
+    sample_type %in% sample_types,
+    
+    # Exclude all WOLF-associated rows robustly
+    !str_detect(coalesce(unique_id, ""), "^WOLF-23-01"),
+    !str_detect(coalesce(site_id, ""), "^WOLF-23-01"),
+    !str_detect(coalesce(carcass_id, ""), "^WOLF-23-01"),
+    
+    # Remove non-carcass-associated soil samples
+    !(sample_type == "Soil" & coalesce(carcass_association, "") != "Y")
+  )
+
+# Define Unique Unit for each Row #
+
+tab_dat <- tab_dat %>%
+  mutate(
+    unit_id = coalesce(as.character(site_id), as.character(carcass_id))
+  )
+
+# Define Tested / Positive Flags #
+tab_dat <- tab_dat %>%
+  mutate(
+    culture_tested = culture_done == "Y" | culture_ac_pos %in% c("Y", "N"),
+    pcr_tested     = pcr_done == "Y"     | pcr_ac_pos %in% c("Y", "N"),
+
+    culture_pos = culture_ac_pos == "Y",
+    pcr_pos     = pcr_ac_pos == "Y",
+
+    any_tested = culture_tested | pcr_tested,
+    any_pos    = case_when(
+      ac_any_pos %in% c("Y", "N") ~ ac_any_pos == "Y",
+      TRUE ~ culture_pos | pcr_pos
+    ),
+      time_known = carcass_association == "Y" & !is.na(year_of_death)
+  )
+
+# Helper for n/Tested (%) Formatting #
+fmt_n_tested <- function(pos, tested, digits = 1) {
+  ifelse(
+    tested > 0,
+    paste0(pos, "/", tested, " (", round(100 * pos / tested, digits), ")"),
+    ""
+  )
+}
+
+fmt_n_pct <- function(n, denom, digits = 1) {
+  ifelse(
+    denom > 0,
+    paste0(n, " (", round(100 * n / denom, digits), ")"),
+    ""
+  )
+}
+
+# Yearly Summaries #
+by_year <- tab_dat %>%
+  group_by(sample_type, sample_year) %>%
+  summarise(
+    samples_n      = n(),
+    unique_units_n = n_distinct(unit_id),
+
+    time_known_n = sum(time_known, na.rm = TRUE),
+
+    culture_pos_n    = sum(culture_pos, na.rm = TRUE),
+    culture_tested_n = sum(culture_tested, na.rm = TRUE),
+
+    pcr_pos_n    = sum(pcr_pos, na.rm = TRUE),
+    pcr_tested_n = sum(pcr_tested, na.rm = TRUE),
+
+    any_pos_n    = sum(any_pos, na.rm = TRUE),
+    any_tested_n = sum(any_tested, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(sample_year = as.character(sample_year))
+
+# Add Empty Rows #
+table_shell <- bind_rows(
+  tibble(sample_type = "Tissue",     sample_year = c("2021", "2022", "2023", "2024")),
+  tibble(sample_type = "Soil",       sample_year = c("2021", "2022", "2023", "2024")),
+  tibble(sample_type = "Water",      sample_year = c("2023", "2024")),
+  tibble(sample_type = "Sediment",   sample_year = c("2023", "2024")),
+  tibble(sample_type = "Vegetation", sample_year = "2024")
+)
+
+table1_years <- table_shell %>%
+  left_join(by_year, by = c("sample_type", "sample_year")) %>%
+  mutate(
+    across(
+      c(samples_n, unique_units_n, time_known_n,
+        culture_pos_n, culture_tested_n,
+        pcr_pos_n, pcr_tested_n,
+        any_pos_n, any_tested_n),
+      ~ replace_na(., 0)
+    )
+  )
+
+# Totals by Sample Type #
+table1_totals <- tab_dat %>%
+  group_by(sample_type) %>%
+  summarise(
+    sample_year = "TOTAL",
+    samples_n      = n(),
+    unique_units_n = n_distinct(unit_id),
+
+    time_known_n = sum(time_known, na.rm = TRUE),
+
+    culture_pos_n    = sum(culture_pos, na.rm = TRUE),
+    culture_tested_n = sum(culture_tested, na.rm = TRUE),
+
+    pcr_pos_n    = sum(pcr_pos, na.rm = TRUE),
+    pcr_tested_n = sum(pcr_tested, na.rm = TRUE),
+
+    any_pos_n    = sum(any_pos, na.rm = TRUE),
+    any_tested_n = sum(any_tested, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+table1_out <- bind_rows(table1_years, table1_totals) %>%
+  mutate(
+    sample_year = as.character(sample_year)
+  ) %>%
+  arrange(
+  factor(sample_type, levels = c("Tissue", "Soil", "Water", "Sediment", "Vegetation")),
+  factor(sample_year, levels = c("2021", "2022", "2023", "2024", "TOTAL"))
+) %>%
+  mutate(
+    Year = sample_year,
+
+    `Samples, n` = samples_n,
+    `Unique Units, n` = unique_units_n,
+    `Time-Known Subset, n (%)` = fmt_n_pct(time_known_n, samples_n),
+
+    `Culture +, +/Tested (%)` = fmt_n_tested(culture_pos_n, culture_tested_n),
+    `PCR +, +/Tested (%)`     = fmt_n_tested(pcr_pos_n, pcr_tested_n),
+    `Any Test +, +/Tested (%)` = fmt_n_tested(any_pos_n, any_tested_n)
+  ) %>%
+  dplyr::select(
+    `Sample Type` = sample_type,
+    Year,
+    `Samples, n`,
+    `Unique Units, n`,
+    `Time-Known Subset, n (%)`,
+    `Culture +, +/Tested (%)`,
+    `PCR +, +/Tested (%)`,
+    `Any Test +, +/Tested (%)`
+  )
+
+table1_out
+
+###################################
+# Generation of Supp Table 1 Data #
+###################################
+
+fmt_n_pct <- function(n, d) {
+  ifelse(
+    is.na(d) | d == 0,
+    "",
+    sprintf("%d (%.1f)", n, 100 * n / d)
+  )
+}
+
+fmt_pos_tested <- function(pos, tested) {
+  ifelse(
+    is.na(tested) | tested == 0,
+    "",
+    sprintf("%d/%d (%.1f)", pos, tested, 100 * pos / tested)
+  )
+}
+
+fmt_n_units <- function(n, units) {
+  ifelse(
+    is.na(n),
+    "",
+    sprintf("%d (%d)", n, units)
+  )
+}
+
+#Prep Data#
+
+supp__soil_dat <- dat %>%
+  mutate(
+    sample_year   = as.character(sample_year),
+    distance_m    = as.numeric(distance_m),
+    distance_lab  = paste0(as.integer(distance_m), " m"),
+    time_known    = !is.na(year_of_death),
+    carcass_id    = as.character(carcass_id),
+    site_id       = as.character(site_id),
+    unique_id     = as.character(unique_id)
+  ) %>%
+  filter(
+    substrate == "Soil",
+    carcass_association == "Y",
+    distance_m %in% c(0, 1, 3, 5, 15)
+  ) %>%
+  filter(
+    !str_detect(carcass_id, "^WOLF-23-01$"),
+    !str_detect(site_id, "^WOLF-23-01$"),
+    !str_detect(unique_id, "^WOLF-23-01")
+  )
+
+#Summarize by Distance-Year#
+
+soil_years <- supp__soil_dat %>%
+  group_by(distance_lab, sample_year) %>%
+  summarise(
+    samples_n       = n(),
+    unique_units_n  = n_distinct(site_id),
+    time_known_n    = sum(time_known, na.rm = TRUE),
+    culture_pos_n   = sum(culture_ac_pos == "Y", na.rm = TRUE),
+    culture_tested_n= sum(culture_done == "Y", na.rm = TRUE),
+    pcr_pos_n       = sum(pcr_ac_pos == "Y", na.rm = TRUE),
+    pcr_tested_n    = sum(pcr_done == "Y", na.rm = TRUE),
+    any_pos_n       = sum(ac_any_pos == "Y", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+soil_totals <- supp__soil_dat %>%
+  group_by(distance_lab) %>%
+  summarise(
+    sample_year      = "TOTAL",
+    samples_n        = n(),
+    unique_units_n   = n_distinct(site_id),
+    time_known_n     = sum(time_known, na.rm = TRUE),
+    culture_pos_n    = sum(culture_ac_pos == "Y", na.rm = TRUE),
+    culture_tested_n = sum(culture_done == "Y", na.rm = TRUE),
+    pcr_pos_n        = sum(pcr_ac_pos == "Y", na.rm = TRUE),
+    pcr_tested_n     = sum(pcr_done == "Y", na.rm = TRUE),
+    any_pos_n        = sum(ac_any_pos == "Y", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+soil_stats <- bind_rows(soil_years, soil_totals)
+
+#Build Table Shell#
+
+table_shell <- tibble(
+  distance_lab = c(
+    "0 m", "0 m", "0 m", "0 m",
+    "1 m", "1 m", "1 m",
+    "3 m", "3 m", "3 m",
+    "5 m", "5 m", "5 m",
+    "15 m", "15 m", "15 m"
+  ),
+  sample_year = c(
+    "2022", "2023", "2024", "TOTAL",
+    "2023", "2024", "TOTAL",
+    "2023", "2024", "TOTAL",
+    "2023", "2024", "TOTAL",
+    "2023", "2024", "TOTAL"
+  )
+)
+
+supp_table_soil_distance <- table_shell %>%
+  left_join(soil_stats, by = c("distance_lab", "sample_year")) %>%
+  mutate(
+    `Sampling Distance`            = distance_lab,
+    Year                           = sample_year,
+    `Samples, n (Unique Units*)`   = fmt_n_units(samples_n, unique_units_n),
+    `Known Time of Death*, n (%)`  = fmt_n_pct(time_known_n, samples_n),
+    `Culture +/Tested (%)`         = fmt_pos_tested(culture_pos_n, culture_tested_n),
+    `PCR +/Tested (%)`             = fmt_pos_tested(pcr_pos_n, pcr_tested_n),
+    `Any Test +/Tested (%)`        = fmt_pos_tested(any_pos_n, samples_n)
+  ) %>%
+  dplyr::select(
+    `Sampling Distance`,
+    Year,
+    `Samples, n (Unique Units*)`,
+    `Known Time of Death*, n (%)`,
+    `Culture +/Tested (%)`,
+    `PCR +/Tested (%)`,
+    `Any Test +/Tested (%)`
+  )
+
+supp_table_soil_distance
+
+```
+
+## Interval Censoring Setup & Turnbull Curve Construction
+```{r Survival Analysis: Interval Censoring Setup & Turnbull Curve Construction, cache=FALSE}
+# Build interval-censored bounds per carcass_id × substrate #
+visits <- visits %>%
+  arrange(carcass_id, substrate, time_since_death_years)
+
+paired_ids <- visits %>%
+  distinct(carcass_id, substrate) %>%
+  count(carcass_id, name = "n_sub") %>%
+  filter(n_sub == 2) %>%
+  pull(carcass_id)
+
+visits_paired <- visits %>%
+  filter(carcass_id %in% paired_ids) %>%
+  arrange(carcass_id, substrate, time_since_death_years)
+
+# adjust carcasses with tissue neg-->pos--neg recurrence #
+tissue_force_L0_ids <- c("MX-21-04", "MX-21-16", "MX-21-26A")
+
+ic_tsd <- visits_paired %>%
+  group_by(carcass_id, substrate) %>%
+  summarise(
+    first_t = min(time_since_death_years, na.rm = TRUE),
+    last_t  = max(time_since_death_years, na.rm = TRUE),
+
+    any_pos = any(pos),
+    last_status = dplyr::last(pos),
+
+    first_pos_t = if (any(pos)) min(time_since_death_years[pos], na.rm = TRUE) else NA_integer_,
+    last_pos_t = if (any(pos)) max(time_since_death_years[pos], na.rm = TRUE) else NA_integer_,
+
+    first_neg_after_last_pos_t = if (any(pos)) {
+      lp <- max(time_since_death_years[pos], na.rm = TRUE)
+      cand <- time_since_death_years[!pos & time_since_death_years > lp]
+      if (length(cand) > 0) min(cand, na.rm = TRUE) else NA_integer_
+    } else NA_integer_,
+
+    censor_type = case_when(
+      !any_pos ~ "left",
+      last_status ~ "right",
+      TRUE ~ "interval"
+    ),
+
+    L = case_when(
+      censor_type == "left" ~ NA_real_,
+      TRUE ~ as.numeric(last_pos_t)
+    ),
+    R = case_when(
+      censor_type == "left" ~ as.numeric(first_t),
+      censor_type == "right" ~ NA_real_,
+      TRUE ~ as.numeric(first_neg_after_last_pos_t)
+    ),
+    .groups = "drop"
+  )
+
+# interval2 bounds for Surv(L2, R2, type="interval2") #
+min_tsd <- min(ic_tsd$R, na.rm = TRUE)
+
+curve_known_tsd2 <- ic_tsd %>%
+  mutate(
+    L2 = if_else(censor_type == "left",  as.numeric(min_tsd - 1), as.numeric(L)),
+    R2 = if_else(censor_type == "right", Inf,                    as.numeric(R)),
+    substrate = factor(substrate, levels = c("Tissue","Soil"))
+  ) %>%
+  filter(!is.na(L2), !is.na(R2), L2 <= R2)
+
+# Curves #
+fit_known_tsd <- survfit(Surv(L2, R2, type = "interval2") ~ substrate,
+                         data = curve_known_tsd2)
+
+plot(fit_known_tsd,
+     xlab = "Years since death",
+     ylab = "Pr(still culture positive)",
+     conf.int = TRUE,
+     mark.time = TRUE,
+     main = "Probability of culture positivity following death")
+legend("topright", legend = levels(curve_known_tsd2$substrate), lty = 1:2, bty = "n")
+
+summary(fit_known_tsd)$table
+
+# Nicer Plot #
+
+theme_pub <- theme_classic(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 12, margin = margin(b = 4)),
+    plot.subtitle   = element_text(size = 10, margin = margin(b = 6)),
+    axis.title      = element_text(face = "bold"),
+    axis.text       = element_text(color = "black"),
+    panel.border    = element_rect(fill = NA, color = "black", linewidth = 0.4),
+    strip.background= element_rect(fill = "grey95", color = NA),
+    strip.text      = element_text(face = "bold"),
+    panel.spacing   = unit(0.9, "lines"),
+    plot.caption    = element_text(size = 8, hjust = 0, margin = margin(t = 6))
+  )
+
+tidy_survfit <- function(fit) {
+  s <- summary(fit)
+
+  tibble(
+    time  = s$time,
+    surv  = s$surv,
+    lower = s$lower,
+    upper = s$upper,
+    strata = if (!is.null(s$strata)) as.character(s$strata) else "All"
+  ) %>%
+    mutate(group = str_replace(strata, ".*=", "")) %>%
+    filter(is.finite(time)) %>%              # drop Inf if present
+    arrange(group, time)
+}
+
+plot_survfit_gg <- function(fit, xlab, title, x_breaks = NULL, x_limits = NULL) {
+  df <- tidy_survfit(fit)
+
+  if (is.null(x_breaks)) {
+    x_breaks <- pretty(range(df$time, na.rm = TRUE), n = 6)
+  }
+
+  ggplot(df, aes(x = time, y = surv, color = group, linetype = group)) +
+    geom_step(linewidth = 1.2) +
+    # CI as dashed steps (clean + journal-friendly)
+    geom_step(aes(y = lower), linewidth = 0.6, alpha = 0.6) +
+    geom_step(aes(y = upper), linewidth = 0.6, alpha = 0.6) +
+    scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+    scale_x_continuous(breaks = x_breaks, limits = x_limits) +
+    labs(
+      x = xlab,
+      y = "Pr(still culture positive)",
+      title = title,
+      color = NULL,
+      linetype = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      legend.position = "top",
+      plot.title = element_text(face = "bold")
+    )
+}
+
+x_breaks_tsd <- seq(floor(min(curve_known_tsd2$L2, na.rm = TRUE)),
+                    ceiling(max(curve_known_tsd2$R2[is.finite(curve_known_tsd2$R2)], na.rm = TRUE)),
+                    by = 1)
+
+p_known <- plot_survfit_gg(
+  fit_known_tsd,
+  xlab = "Years Since Death",
+  title = NULL,
+  x_breaks = x_breaks_tsd
+) + theme_pub
+p_known
+
+```
+
+## Log-rank & Paired Permutation Tests
+```{r Survival Analysis: Log-rank & Paired Permutation Tests, cache=FALSE}
+# Log-rank analogue #
+curve_known_tsd2 <- curve_known_tsd2 %>%
+  mutate(substrate = factor(substrate))
+
+test_ic_logrank <- interval::ictest(
+  Surv(L2, R2, type = "interval2") ~ substrate,
+  data = curve_known_tsd2,
+  scores = "logrank1",
+  method = "pclt"
+)
+
+test_ic_logrank
+
+# Paired Permutation Log-rank analogue #
+extract_Z_safe <- function(obj) {
+  z <- NULL
+  if (!is.null(obj$Z)) z <- obj$Z
+  else if (!is.null(obj$statistic)) z <- obj$statistic
+  z <- suppressWarnings(as.numeric(z))
+  if (length(z) == 0) return(NA_real_)
+  z[1]
+}
+
+paired_perm_ictest <- function(dat, B = 5000, seed = 1) {
+  set.seed(seed)
+
+  dat <- dat %>%
+    mutate(substrate = factor(substrate)) %>%
+    arrange(carcass_id, substrate)
+
+  tab <- table(dat$carcass_id)
+  if (any(tab != 2)) {
+    stop("Not all carcass_id have exactly 2 rows (Soil + Tissue). Check pairing filter.")
+  }
+
+  obs <- interval::ictest(Surv(L2, R2, type="interval2") ~ substrate,
+                          data = dat, scores="logrank1", method="pclt")
+  obs_z <- extract_Z_safe(obs)
+
+  ids <- unique(dat$carcass_id)
+
+  perm_z <- vapply(seq_len(B), function(i) {
+    flip_ids <- ids[runif(length(ids)) < 0.5]
+
+    datp <- dat
+    idx <- datp$carcass_id %in% flip_ids
+
+    s <- as.character(datp$substrate)
+    s[idx] <- ifelse(s[idx] == "Soil", "Tissue",
+              ifelse(s[idx] == "Tissue", "Soil", s[idx]))
+    datp$substrate <- factor(s, levels = levels(dat$substrate))
+
+    z <- tryCatch(
+      extract_Z_safe(interval::ictest(Surv(L2, R2, type="interval2") ~ substrate,
+                                      data = datp, scores="logrank1", method="pclt")),
+      error = function(e) NA_real_
+    )
+    z
+  }, numeric(1))
+
+  keep <- !is.na(perm_z)
+  perm_z2 <- perm_z[keep]
+
+  p_two_sided <- (sum(abs(perm_z2) >= abs(obs_z)) + 1) / (length(perm_z2) + 1)
+
+  list(
+    observed_test = obs,
+    observed_Z = obs_z,
+    perm_p_two_sided = p_two_sided,
+    B_requested = B,
+    B_used = length(perm_z2),
+    n_failed = sum(!keep)
+  )
+}
+
+perm_res2 <- paired_perm_ictest(curve_known_tsd2, B = 5000, seed = 1)
+perm_res2$observed_test
+perm_res2$perm_p_two_sided
+```
+
+## Semi-Parametric Regression Models
+```{r, Survival Analysis: Semi-Parametric Regression Models, cache=TRUE}
+
+library(tidyverse)
+library(survival)
+library(icenReg)
+library(foreach)
+library(doParallel)
+
+# Prep: filter data & define “pos”, keep paired carcasses , collapse habitat classes#
+
+dat0 <- dat %>%
+  filter(
+    carcass_association == "Y",
+    !is.na(year_of_death),
+    site_id != "WOLF-23-01",
+    carcass_id != "WOLF-23-01",
+    substrate %in% c("Soil","Tissue"),
+    !is.na(culture_ac_pos),
+    !is.na(time_since_death_years)
+  ) %>%
+  mutate(pos = culture_ac_pos == "Y",
+  time_since_death_years = as.numeric(time_since_death_years))
+
+curve_ids <- dat0 %>%
+  distinct(carcass_id, substrate) %>%
+  count(carcass_id, name = "n_sub") %>%
+  filter(n_sub == 2) %>%
+  pull(carcass_id)
+
+dist_keep <- c(0, 1, 3, 5)
+
+soil_dat <- dat0 %>%
+  filter(
+    substrate == "Soil",
+    carcass_id %in% curve_ids,
+    !is.na(distance_m),
+    as.numeric(distance_m) %in% dist_keep) %>%
+  mutate(distance_m = as.numeric(distance_m))
+
+  #3-level habitat classes by moisture#
+make_habitat_moist3 <- function(x) {
+  x <- as.character(x)
+  out <- dplyr::case_when(
+    x == "Tundra Barrens" ~ "Dry",
+    x %in% c("Hummock Tundra", "Tundra Meadow") ~ "Medium",
+    x %in% c("Riparian Tundra", "Riverbed", "Tundra Wetland") ~ "Wet",
+    TRUE ~ NA_character_
+  )
+
+  factor(
+    out,
+    levels = c(
+      "Dry",
+      "Medium",
+      "Wet"
+    )
+  )
+}
+
+# Build interval-censored bounds #
+
+make_ic_series <- function(dat_series, series_vars) {
+
+  visits <- dat_series %>%
+    group_by(across(all_of(series_vars)), time_since_death_years) %>%
+    summarise(
+      pos = any(pos, na.rm = TRUE),
+
+      carcass_size   = dplyr::first(na.omit(carcass_size)),
+      habitat_class  = dplyr::first(na.omit(habitat_class)),
+      year_of_death         = dplyr::first(na.omit(year_of_death)),
+      sample_year    = suppressWarnings(min(sample_year, na.rm = TRUE)),
+
+      .groups = "drop"
+    ) %>%
+    arrange(across(all_of(series_vars)), time_since_death_years)
+
+  ic <- visits %>%
+    group_by(across(all_of(series_vars))) %>%
+    summarise(
+      first_t = min(time_since_death_years, na.rm = TRUE),
+
+      any_pos = any(pos),
+      last_status = dplyr::last(pos),
+
+      last_pos_t = if (any(pos)) max(time_since_death_years[pos], na.rm = TRUE) else NA_real_,
+
+      first_neg_after_last_pos_t = if (any(pos)) {
+        lp <- max(time_since_death_years[pos], na.rm = TRUE)
+        cand <- time_since_death_years[!pos & time_since_death_years > lp]
+        if (length(cand) > 0) min(cand, na.rm = TRUE) else NA_real_
+      } else NA_real_,
+
+      censor_type = case_when(
+        !any_pos ~ "left",
+        last_status ~ "right",
+        TRUE ~ "interval"
+      ),
+
+      L = case_when(
+        censor_type == "left" ~ NA_real_,
+        TRUE ~ last_pos_t
+      ),
+      R = case_when(
+        censor_type == "left"  ~ first_t,
+        censor_type == "right" ~ NA_real_,
+        TRUE ~ first_neg_after_last_pos_t
+      ),
+
+      carcass_size  = dplyr::first(na.omit(carcass_size)),
+      habitat_class = dplyr::first(na.omit(habitat_class)),
+      year_of_death        = dplyr::first(na.omit(year_of_death)),
+      sample_year   = dplyr::first(na.omit(sample_year)),
+
+      .groups = "drop"
+    )
+
+  min_R <- min(ic$R, na.rm = TRUE)
+
+  ic2 <- ic %>%
+    mutate(
+      L2 = if_else(censor_type == "left",  as.numeric(min_R - 1), as.numeric(L)),
+      R2 = if_else(censor_type == "right", Inf,                    as.numeric(R))
+    ) %>%
+    filter(!is.na(L2), !is.na(R2), L2 <= R2)
+
+  list(visits = visits, ic = ic2)
+}
+
+### TISSUE MODELS ###
+
+set.seed(1)
+
+tissue_dat <- dat0 %>%
+  filter(
+    substrate == "Tissue",
+    carcass_id %in% curve_ids
+  )
+
+tissue_obj <- make_ic_series(tissue_dat, series_vars = c("carcass_id"))
+
+ic_tissue_raw <- tissue_obj$ic %>%
+  transmute(
+    carcass_id,
+    L2, R2, censor_type,
+    carcass_size  = factor(carcass_size),
+    habitat_class = factor(habitat_class),
+    habitat_moist3 = make_habitat_moist3(habitat_class),
+    year          = as.numeric(year_of_death),
+    year_num      = as.numeric(year_of_death) - 2021
+  ) %>%
+  filter(
+    !is.na(L2), !is.na(R2),
+    !is.na(carcass_size),
+    !is.na(habitat_moist3),
+    !is.na(year),
+    L2 <= R2
+  )
+
+stopifnot(nrow(ic_tissue_raw) == 37)
+
+ic_tissue_red <- ic_tissue_raw %>%
+  mutate(
+    year_bin = ifelse(year <= 2021, "2021-or-earlier", "2022-or-later"),
+    year_bin = factor(year_bin, levels = c("2021-or-earlier", "2022-or-later"))
+  )
+
+ic_tissue_red <- ic_tissue_red %>%
+  mutate(
+    carcass_size = relevel(carcass_size, ref = levels(carcass_size)[1]))
+
+ctrl <- makeCtrls_icsp(useGA = FALSE, maxIter = 30000, baseUpdates = 10)
+
+fit_icsp_ci <- function(formula, data, bs = 500, useMCores = TRUE, ctrls = NULL) {
+
+  if (is.null(ctrls)) {
+    ctrls <- icenReg::makeCtrls_icsp(useGA = FALSE, maxIter = 30000, baseUpdates = 10)
+  }
+
+  fit <- icenReg::ic_sp(
+    formula,
+    data       = data,
+    model      = "ph",
+    B          = c(0, 1),
+    bs_samples = bs,
+    useMCores  = useMCores,
+    controls   = ctrls
+  )
+
+  b0 <- coef(fit)
+  bsMat <- fit$bsMat
+  bs_ok <- bsMat[stats::complete.cases(bsMat), , drop = FALSE]
+
+  ci_log <- t(apply(bs_ok, 2, stats::quantile, probs = c(0.025, 0.975), na.rm = TRUE))
+
+  tab <- tibble::tibble(
+    term  = names(b0),
+    logHR = as.numeric(b0),
+    HR    = exp(logHR),
+    CI_lo = exp(ci_log[, 1]),
+    CI_hi = exp(ci_log[, 2])
+  )
+
+  list(fit = fit, table = tab, n_boot_used = nrow(bs_ok))
+}
+
+#Carcass Size Univariable Model#
+m_size <- fit_icsp_ci(
+  Surv(L2, R2, type = "interval2") ~ carcass_size,
+  data = ic_tissue_raw,
+  bs   = 500,
+  useMCores = TRUE,
+  ctrls = ctrl
+)
+
+m_size$table
+
+#Habitat Class Univariable Model#
+m_hab_red <- fit_icsp_ci(
+  Surv(L2, R2, type="interval2") ~ habitat_moist3,
+  data = ic_tissue_red,
+  bs = 500,
+  useMCores = TRUE,
+  ctrls = ctrl
+)
+
+m_hab_red$table
+
+#Year of Death (continuous) Univariable Model#
+m_year_cont <- fit_icsp_ci(
+  Surv(L2, R2, type = "interval2") ~ year_num,
+  data = ic_tissue_raw,
+  bs   = 500,
+  useMCores = TRUE,
+  ctrls = ctrl
+)
+
+m_year_cont$table
+
+#Year of Death (categorical) Univariable Model#
+m_year_bin <- fit_icsp_ci(
+  Surv(L2, R2, type="interval2") ~ year_bin,
+  data = ic_tissue_red,
+  bs = 500,
+  useMCores = TRUE,
+  ctrls = ctrl
+)
+
+m_year_bin$table
+
+#Carcass Size and Year of Death (continuous) Model#
+m_size_year <- fit_icsp_ci(
+  Surv(L2, R2, type="interval2") ~ carcass_size + year_num,
+  data = ic_tissue_raw,
+  bs = 500,
+  useMCores = TRUE,
+  ctrls = ctrl
+)
+
+m_size_year$table
+
+#Habitat Class and Year of Death (continuous) Model#
+m_hab_year <- fit_icsp_ci(
+  Surv(L2, R2, type="interval2") ~ habitat_moist3 + year_num,
+  data = ic_tissue_red,
+  bs = 500,
+  useMCores = TRUE,
+  ctrls = ctrl
+)
+
+m_hab_year$table
+
+#Habitat Class, Carcass Size, and Year of Death (continuous) Model#
+m_full_tiss <- fit_icsp_ci(
+  Surv(L2, R2, type="interval2") ~ habitat_moist3 + year_num + carcass_size,
+  data = ic_tissue_red,
+  bs = 500,
+  useMCores = TRUE,
+  ctrls = ctrl
+)
+
+m_full_tiss$table
+
+### SOIL MODELS ###
+
+soil_obj <- make_ic_series(soil_dat, series_vars = c("carcass_id", "distance_m"))
+
+ic_soil_raw <- soil_obj$ic %>%
+  transmute(
+    carcass_id,
+    distance_m,
+    L2, R2, censor_type,
+    carcass_size  = factor(carcass_size),
+    habitat_class = factor(habitat_class),
+    habitat_moist3 = make_habitat_moist3(habitat_class),
+    year          = as.numeric(year_of_death),
+    year_num      = as.numeric(year_of_death) - 2021
+  ) %>%
+  filter(
+    !is.na(L2), !is.na(R2),
+    !is.na(distance_m),
+    !is.na(carcass_size),
+    !is.na(habitat_moist3),
+    !is.na(year_num),
+    L2 <= R2
+  ) %>%
+  mutate(
+    distance_m = as.numeric(distance_m),
+    distance_f = factor(distance_m, levels = dist_keep),
+    distance_f = forcats::fct_relevel(distance_f, "0"),
+    carcass_size = relevel(carcass_size, ref = levels(carcass_size)[1]),
+    habitat_class = droplevels(habitat_class)
+  )
+
+ic_soil_cont <- ic_soil_raw %>%
+  mutate(
+    dist_m = as.numeric(distance_m),
+    year_c = year_num - mean(year_num, na.rm = TRUE)
+  )
+
+#Carcass-Level Cluster Bootstrap#
+cluster_boot_icsp <- function(dat_ic, formula, idvar = "carcass_id",
+                              B = 500, seed = 1, ctrls = ctrl) {
+
+  set.seed(seed)
+  ids <- unique(dat_ic[[idvar]])
+
+  # point estimate
+  fit0 <- icenReg::ic_sp(formula, data = dat_ic, model = "ph", B = c(0,1), bs_samples = 0, controls = ctrls)
+  b0 <- coef(fit0)
+
+  boot <- matrix(NA_real_, nrow = B, ncol = length(b0))
+  colnames(boot) <- names(b0)
+  n_fail <- 0L
+
+  for (b in seq_len(B)) {
+    samp_ids <- sample(ids, size = length(ids), replace = TRUE)
+
+    boot_dat <- purrr::map_dfr(samp_ids, ~ dplyr::filter(dat_ic, .data[[idvar]] == .x))
+
+    fit_b <- tryCatch(
+      icenReg::ic_sp(formula, data = boot_dat, model = "ph", B = c(0,1), bs_samples = 0, controls = ctrls),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_b)) { n_fail <- n_fail + 1L; next }
+
+    cb <- tryCatch(coef(fit_b), error = function(e) NULL)
+    if (is.null(cb)) { n_fail <- n_fail + 1L; next }
+
+    boot[b, names(cb)] <- as.numeric(cb)
+  }
+
+  boot_df <- as_tibble(boot) %>% dplyr::filter(if_all(everything(), ~ !is.na(.x)))
+
+  ci_log <- t(apply(boot_df, 2, quantile, probs = c(0.025, 0.975), na.rm = TRUE))
+
+  tab <- tibble(
+    term  = names(b0),
+    logHR = as.numeric(b0),
+    HR    = exp(logHR),
+    CI_lo = exp(ci_log[, 1]),
+    CI_hi = exp(ci_log[, 2])
+  )
+
+  list(
+    fit0 = fit0,
+    table = tab,
+    n_used = nrow(boot_df),
+    n_failed = n_fail
+  )
+}
+
+#Carcass Level Warm Cluster Bootstrap#
+cluster_boot_icsp_warm <- function(dat_ic, formula, idvar="carcass_id",
+                                   B = 300, seed = 1, ctrls = ctrl_mv_warm) {
+  set.seed(seed)
+  ids <- unique(dat_ic[[idvar]])
+
+  fit0 <- icenReg::ic_sp(formula, data = dat_ic, model="ph", B=c(0,1), bs_samples=0, controls=ctrls)
+  b0 <- coef(fit0)
+
+  boot <- matrix(NA_real_, nrow = B, ncol = length(b0))
+  colnames(boot) <- names(b0)
+
+  n_fail <- 0L
+
+  for (b in seq_len(B)) {
+    samp_ids <- sample(ids, length(ids), replace = TRUE)
+    boot_dat <- purrr::map_dfr(samp_ids, ~ dplyr::filter(dat_ic, .data[[idvar]] == .x))
+
+    fit_b <- tryCatch(
+      icenReg::ic_sp(formula, data = boot_dat, model="ph", B=c(0,1), bs_samples=0, controls=ctrls),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_b)) { n_fail <- n_fail + 1L; next }
+
+    cb <- tryCatch(coef(fit_b), error = function(e) NULL)
+    if (is.null(cb)) { n_fail <- n_fail + 1L; next }
+
+    boot[b, names(cb)] <- as.numeric(cb)
+  }
+
+  boot_ok <- boot[stats::complete.cases(boot), , drop=FALSE]
+
+  ci_log <- t(apply(boot_ok, 2, stats::quantile, probs=c(0.025,0.975), na.rm=TRUE))
+  tab <- tibble::tibble(
+    term  = names(b0),
+    logHR = as.numeric(b0),
+    HR    = exp(logHR),
+    CI_lo = exp(ci_log[,1]),
+    CI_hi = exp(ci_log[,2])
+  )
+
+  list(fit0 = fit0, table = tab, n_used = nrow(boot_ok), n_failed = n_fail)
+}
+
+#Distance (factor) Univariable Model#
+m_dist <- cluster_boot_icsp(
+  dat_ic  = ic_soil_raw,
+  formula = Surv(L2, R2, type="interval2") ~ distance_f,
+  idvar   = "carcass_id",
+  B       = 500,
+  seed    = 1,
+  ctrls   = ctrl
+)
+
+m_dist$table
+m_dist$n_used
+m_dist$n_failed
+
+#Distance (continuous) Univariable Model#
+m_dist_cont <- cluster_boot_icsp(
+  dat_ic  = ic_soil_cont,
+  formula = Surv(L2, R2, type="interval2") ~ dist_m,
+  idvar   = "carcass_id",
+  B       = 500,
+  seed    = 1,
+  ctrls   = ctrl
+)
+
+m_dist_cont$table
+
+#Carcass Size Univariable Model#
+m_size_soil <- cluster_boot_icsp(
+  ic_soil_raw,
+  Surv(L2, R2, type="interval2") ~ carcass_size,
+  idvar = "carcass_id",
+  B = 500,
+  seed = 1,
+  ctrls = ctrl
+)
+
+m_size_soil$table
+
+#Year of Death (continuous) Univariable Model#
+m_year_soil <- cluster_boot_icsp(
+  ic_soil_raw,
+  Surv(L2, R2, type="interval2") ~ year_num,
+  idvar = "carcass_id",
+  B = 500, 
+  seed = 1, 
+  ctrls = ctrl
+)
+
+m_year_soil$table
+
+#Habitat Class Univariable Model#
+m_hab_soil <- cluster_boot_icsp(
+  ic_soil_raw,
+  Surv(L2, R2, type="interval2") ~ habitat_moist3,
+  idvar = "carcass_id",
+  B = 500, 
+  seed = 1, 
+  ctrls = ctrl
+)
+
+m_hab_soil$table
+
+#Distance (factor) and Year of Death (continuous) Multivariable Model#
+ctrl_base <- icenReg::makeCtrls_icsp(useGA = TRUE, maxIter = 30000, baseUpdates = 5)
+
+ic_soil_mv <- ic_soil_raw %>%
+  dplyr::mutate(
+    year_c = year_num - mean(year_num, na.rm = TRUE) #centered
+  )
+
+fit_full <- icenReg::ic_sp(
+  Surv(L2, R2, type="interval2") ~ distance_f + year_c,
+  data = ic_soil_mv,
+  model = "ph", B = c(0,1),
+  bs_samples = 0,
+  controls = ctrl_base
+)
+
+ctrl_mv_warm <- icenReg::makeCtrls_icsp(
+  useGA = TRUE,
+  maxIter = 30000,
+  baseUpdates = 5,
+  regStart = coef(fit_full)
+)
+
+m_dist_year <- cluster_boot_icsp_warm(
+  dat_ic  = ic_soil_mv,
+  formula = Surv(L2, R2, type="interval2") ~ distance_f + year_c,
+  idvar   = "carcass_id",
+  B       = 200,
+  seed    = 1,
+  ctrls   = ctrl_mv_warm
+)
+
+m_dist_year$table
+
+#Distance (continuous) and Year of Death (continuous) Sensitivity Model#
+fit_full_cont <- icenReg::ic_sp(
+  Surv(L2, R2, type = "interval2") ~ dist_m + year_c,
+  data       = ic_soil_cont,
+  model      = "ph",
+  B          = c(0,1),
+  bs_samples = 0,
+  controls   = ctrl_base
+)
+
+ctrl_warm_cont <- icenReg::makeCtrls_icsp(
+  useGA = TRUE,
+  maxIter = 30000,
+  baseUpdates = 5,
+  regStart = coef(fit_full_cont)
+)
+
+m_dist_year_cont <- cluster_boot_icsp_warm(
+  dat_ic  = ic_soil_cont,
+  formula = Surv(L2, R2, type = "interval2") ~ dist_m + year_c,
+  idvar   = "carcass_id",
+  B       = 200,
+  seed    = 1,
+  ctrls   = ctrl_warm_cont
+)
+
+m_dist_year_cont$table
+
+#Distance (factor), Carcass Size, and Year of Death (continuous) Multivariable Model#
+fit_full_size <- icenReg::ic_sp(
+  Surv(L2, R2, type="interval2") ~ distance_f + year_c + carcass_size,
+  data       = ic_soil_mv,
+  model      = "ph",
+  B          = c(0,1),
+  bs_samples = 0,
+  controls   = ctrl_base
+)
+
+ctrl_warm_size <- icenReg::makeCtrls_icsp(
+  useGA = TRUE, maxIter = 30000, baseUpdates = 5,
+  regStart = coef(fit_full_size)
+)
+
+m_dist_size_year <- cluster_boot_icsp_warm(
+  dat_ic  = ic_soil_mv,
+  formula = Surv(L2, R2, type="interval2") ~ distance_f + year_c + carcass_size,
+  idvar   = "carcass_id",
+  B       = 200,
+  seed    = 1,
+  ctrls   = ctrl_warm_size
+)
+
+m_dist_size_year$table
+
+#Distance (continuous), Carcass Size, and Year of Death (continuous) Sensitivity Model#
+fit_full_cont_size <- icenReg::ic_sp(
+  Surv(L2, R2, type = "interval2") ~ dist_m + year_c + carcass_size,
+  data       = ic_soil_cont,
+  model      = "ph",
+  B          = c(0,1),
+  bs_samples = 0,
+  controls   = ctrl_base
+)
+
+ctrl_warm_cont_size <- icenReg::makeCtrls_icsp(
+  useGA = TRUE,
+  maxIter = 30000,
+  baseUpdates = 5,
+  regStart = coef(fit_full_cont_size)
+)
+
+m_dist_size_year_cont <- cluster_boot_icsp_warm(
+  dat_ic  = ic_soil_cont,
+  formula = Surv(L2, R2, type = "interval2") ~ dist_m + year_c + carcass_size,
+  idvar   = "carcass_id",
+  B       = 200,
+  seed    = 1,
+  ctrls   = ctrl_warm_cont_size
+)
+
+m_dist_size_year_cont$table
+
+#Distance (factor), Habitat Class, and Year of Death (continuous) Multivariable Model# 
+fit_full_hab <- icenReg::ic_sp(
+  Surv(L2, R2, type="interval2") ~ distance_f + year_c + habitat_moist3,
+  data = ic_soil_mv,
+  model = "ph", B = c(0,1),
+  bs_samples = 0,
+  controls = ctrl_base
+)
+
+ctrl_warm_hab <- icenReg::makeCtrls_icsp(
+  useGA = TRUE, maxIter = 30000, baseUpdates = 5,
+  regStart = coef(fit_full_hab)
+)
+
+m_dist_hab_year <- cluster_boot_icsp_warm(
+  ic_soil_mv,
+  Surv(L2, R2, type="interval2") ~ distance_f + year_c + habitat_moist3,
+  idvar = "carcass_id",
+  B = 200, seed = 1,
+  ctrls = ctrl_warm_hab
+)
+
+m_dist_hab_year$table
+
+#Distance (continuous), Habitat Class, and Year of Death (continuous) Sensitivity Model# 
+fit_full_cont_hab <- icenReg::ic_sp(
+  Surv(L2, R2, type = "interval2") ~ dist_m + year_c + habitat_moist3,
+  data       = ic_soil_cont,
+  model      = "ph",
+  B          = c(0,1),
+  bs_samples = 0,
+  controls   = ctrl_base
+)
+
+ctrl_warm_cont_hab <- icenReg::makeCtrls_icsp(
+  useGA = TRUE,
+  maxIter = 30000,
+  baseUpdates = 5,
+  regStart = coef(fit_full_cont_hab)
+)
+
+m_dist_hab_year_cont <- cluster_boot_icsp_warm(
+  dat_ic  = ic_soil_cont,
+  formula = Surv(L2, R2, type = "interval2") ~ dist_m + year_c + habitat_moist3,
+  idvar   = "carcass_id",
+  B       = 200,
+  seed    = 1,
+  ctrls   = ctrl_warm_cont_hab
+)
+
+m_dist_hab_year_cont$table
+
+#Distance (factor), Habitat Class, Carcass Size, and Year of Death (continuous) Multivariable Model# 
+fit_full_soil <- icenReg::ic_sp(
+  Surv(L2, R2, type = "interval2") ~ distance_f + year_c + habitat_moist3 + carcass_size,
+  data       = ic_soil_mv,
+  model      = "ph",
+  B          = c(0,1),
+  bs_samples = 0,
+  controls   = ctrl_base
+)
+
+ctrl_warm_full_soil <- icenReg::makeCtrls_icsp(
+  useGA = TRUE,
+  maxIter = 30000,
+  baseUpdates = 5,
+  regStart = coef(fit_full_soil)
+)
+
+m_full_soil <- cluster_boot_icsp_warm(
+  dat_ic  = ic_soil_mv,
+  formula = Surv(L2, R2, type = "interval2") ~ distance_f + year_c + habitat_moist3 + carcass_size,
+  idvar   = "carcass_id",
+  B       = 200,
+  seed    = 1,
+  ctrls   = ctrl_warm_full_soil
+)
+
+m_full_soil$table
+
+```
+
+
+# Latent Bacterial Population Modelling
+## Setup & Model Fitting
+```{r Latent Bacterial Population Modelling, cache=FALSE}
+
+#Data Setup#
+dat0 <- dat %>%
+  filter(
+    carcass_association == "Y",
+    substrate %in% c("Tissue", "Soil"),
+    !is.na(year_of_death),
+    !is.na(carcass_id),
+    carcass_id != "WOLF-23-01",
+    culture_done == "Y",
+    culture_ac_pos %in% c("Y", "N")
+  ) %>%
+  mutate(
+    time_since_death_years = as.numeric(time_since_death_years),
+    distance_m = as.numeric(distance_m),
+    year_num = as.numeric(year_of_death) - 2021,
+    carcass_size = factor(carcass_size),
+    habitat_moist3 = make_habitat_moist3(habitat_class)
+  )
+
+paired_ids <- dat0 %>%
+  group_by(carcass_id) %>%
+  summarise(n_sub = n_distinct(substrate), .groups = "drop") %>%
+  filter(n_sub == 2) %>%
+  pull(carcass_id)
+
+dat0 <- dat0 %>% filter(carcass_id %in% paired_ids)
+
+stopifnot(!any(is.na(dat0$habitat_moist3)))
+
+#Collapse Data to Visits (by substrate)#
+tiss_vis <- dat0 %>%
+  filter(substrate == "Tissue") %>%
+  group_by(carcass_id, time_since_death_years) %>%
+  summarise(
+    y = as.integer(any(culture_ac_pos == "Y")),
+    year_num = first(year_num),
+    carcass_size = first(carcass_size),
+    habitat_class = first(habitat_class),
+    habitat_moist3 = first(habitat_moist3),
+    .groups = "drop"
+  )
+
+soil_vis <- dat0 %>%
+  filter(substrate == "Soil",
+         !is.na(distance_m),
+         as.numeric(distance_m) %in% dist_keep) %>%
+  mutate(
+    distance_m = as.numeric(distance_m),
+    distance_f = factor(distance_m, levels = dist_keep),
+    distance_f = forcats::fct_relevel(distance_f, "0")
+  ) %>%
+  group_by(carcass_id, distance_f, time_since_death_years) %>%
+  summarise(
+    y = as.integer(any(culture_ac_pos == "Y")),
+    year_num = first(year_num),
+    carcass_size = first(carcass_size),
+    habitat_moist3 = first(habitat_moist3),
+    distance_m = first(distance_m),
+    .groups = "drop"
+  )
+
+soil_vis_cont <- dat0 %>%
+  filter(
+    substrate == "Soil",
+    !is.na(distance_m),
+    as.numeric(distance_m) %in% dist_keep
+  ) %>%
+  mutate(distance_m = as.numeric(distance_m)) %>%
+  group_by(carcass_id, distance_m, time_since_death_years) %>%
+  summarise(
+    y = as.integer(any(culture_ac_pos == "Y")),
+    year_num = first(year_num),
+    carcass_size = first(carcass_size),
+    habitat_moist3 = first(habitat_moist3),
+    .groups = "drop"
+  )
+
+#Fit cloglog Mechanistic Models#
+library(glmmTMB)
+
+m_tiss <- glmmTMB(
+  y ~ time_since_death_years + habitat_moist3 + carcass_size + (1 | carcass_id),
+  family = binomial(link = "cloglog"),
+  data = tiss_vis
+)
+
+m_soil <- glmmTMB(
+  y ~ time_since_death_years + distance_f + habitat_moist3 + carcass_size + (1 | carcass_id),
+  family = binomial(link = "cloglog"),
+  data = soil_vis
+)
+
+m_soil_cont <- glmmTMB(
+  y ~ time_since_death_years + distance_m + habitat_moist3 + carcass_size + (1 | carcass_id),
+  family = binomial(link = "cloglog"),
+  data = soil_vis_cont
+)
+
+summary(m_tiss)
+summary(m_soil)
+summary(m_soil_cont)
+
+b_time_tiss <- fixef(m_tiss)$cond["time_since_death_years"]
+k_tiss <- -b_time_tiss
+t_half_tiss <- log(2) / k_tiss
+k_tiss; t_half_tiss
+
+b_time_soil <- fixef(m_soil)$cond["time_since_death_years"]
+k_soil <- -b_time_soil
+t_half_soil <- log(2) / k_soil
+k_soil; t_half_soil
+
+b_dist <- fixef(m_soil)$cond[grep("^distance_f", names(fixef(m_soil)$cond))]
+exp(b_dist)  # odds ratios / hazard-like contrasts vs 0m
+
+b_dist_cont <- fixef(m_soil_cont)$cond["distance_m"]
+att_per_m_cont <- exp(b_dist_cont)
+
+c(att_per_m_cont = att_per_m_cont)
+
+#Soil model with time*distance interaction term*
+m_soil_timedistint <- glmmTMB(
+  y ~ time_since_death_years * distance_f + habitat_moist3 + carcass_size + (1|carcass_id),
+  family = binomial(link="cloglog"),
+  data = soil_vis
+)
+
+summary(m_soil_timedistint) #muddied by sparsity of positives at distance --> retain model w/o interaction#
+
+tidy_cloglog_exp <- function(mod) {
+  sm <- summary(mod)$coefficients$cond
+  est <- sm[, "Estimate"]
+  se  <- sm[, "Std. Error"]
+  z   <- sm[, "z value"]
+  p   <- sm[, "Pr(>|z|)"]
+  
+  tibble(
+    term = rownames(sm),
+    estimate = est,
+    std_error = se,
+    z_value = z,
+    p_value = p,
+    exp_coef = exp(est),
+    ci_low = exp(est - 1.96 * se),
+    ci_high = exp(est + 1.96 * se)
+  )
+}
+
+clog_tiss_tab <- tidy_cloglog_exp(m_tiss)
+clog_soil_tab <- tidy_cloglog_exp(m_soil)
+clog_soil_int_tab <- tidy_cloglog_exp(m_soil_timedistint)
+
+clog_tiss_tab
+clog_soil_tab
+clog_soil_int_tab
+
+```
+
+## Predicted-Curve Plots
+```{r Latent Bacterial Population Modelling: Predicted-Curve Plots, cache=FALSE}
+
+library(tidyverse)
+library(scales)
+
+inv_cloglog <- function(eta) 1 - exp(-exp(eta))
+
+pred_ci_cloglog <- function(model, newdata, level = 0.95) {
+  pr <- predict(model, newdata = newdata, type = "link", se.fit = TRUE, re.form = NA)
+  z <- qnorm(1 - (1 - level)/2)
+
+  newdata %>%
+    mutate(
+      eta = pr$fit,
+      se  = pr$se.fit,
+      eta_lo = eta - z * se,
+      eta_hi = eta + z * se,
+      p      = inv_cloglog(eta),
+      p_lo   = inv_cloglog(eta_lo),
+      p_hi   = inv_cloglog(eta_hi)
+    )
+}
+
+make_col <- function(mf, var, value, n) {
+  if (is.factor(mf[[var]])) factor(value, levels = levels(mf[[var]])) else rep(as.character(value), n)
+}
+
+#Tissue Predicted Curve (ref = most common factor levels)#
+mf <- model.frame(m_tiss)
+
+ref_hab_t  <- names(sort(table(mf$habitat_moist3), decreasing = TRUE))[1]
+ref_size_t <- names(sort(table(mf$carcass_size),  decreasing = TRUE))[1]
+
+t_grid <- tibble(
+  time_since_death_years = seq(min(mf$time_since_death_years, na.rm = TRUE),
+                               max(mf$time_since_death_years, na.rm = TRUE),
+                               length.out = 200),
+  habitat_moist3 = make_col(mf, "habitat_moist3", ref_hab_t, 200),
+  carcass_size = if (is.factor(mf$carcass_size)) {
+    factor(ref_size_t, levels = levels(mf$carcass_size))
+  } else {
+    rep(ref_size_t, 200)
+  }
+)
+
+t_pred <- pred_ci_cloglog(m_tiss, t_grid)
+
+ggplot(t_pred, aes(time_since_death_years, p)) +
+  geom_ribbon(aes(ymin = p_lo, ymax = p_hi), alpha = 0.2) +
+  geom_line() +
+  labs(
+    x = "Years Since Death",
+    y = "Predicted P(Culture+)",
+    title = "Predicted Tissue Culture Positivity Over Time",
+  ) +
+  coord_cartesian(ylim = c(0, 1))
+
+#Tissue Predicted Curve (ref = small carcass size)#
+mf <- model.frame(m_tiss)
+
+ref_hab_t <- names(sort(table(mf$habitat_moist3), decreasing = TRUE))[1]
+
+size_want <- "1"
+size_col <- if (is.factor(mf$carcass_size)) {
+  factor(size_want, levels = levels(mf$carcass_size))
+} else {
+  size_want
+}
+
+t_grid_size1 <- tibble(
+  time_since_death_years = seq(min(mf$time_since_death_years, na.rm = TRUE),
+                               max(mf$time_since_death_years, na.rm = TRUE),
+                               length.out = 200),
+  habitat_moist3 = make_col(mf, "habitat_moist3", ref_hab_t, 200),
+  carcass_size  = size_col
+)
+
+t_pred_size1 <- pred_ci_cloglog(m_tiss, t_grid_size1)
+
+ggplot(t_pred_size1, aes(time_since_death_years, p)) +
+  geom_ribbon(aes(ymin = p_lo, ymax = p_hi), alpha = 0.2) +
+  geom_line() +
+  labs(
+    x = "Years since death",
+    y = "Predicted P(culture+)",
+    title = "Predicted Tissue Culture Positivity Over Time, Small Carcasses",
+  ) +
+  coord_cartesian(ylim = c(0, 1))
+
+#Soil Predicted Curves by Distance (ref = most common factor levels)#
+
+mf_s <- model.frame(m_soil)
+
+ref_hab_s  <- names(sort(table(mf_s$habitat_moist3), decreasing = TRUE))[1]
+ref_size_s <- names(sort(table(mf_s$carcass_size),  decreasing = TRUE))[1]
+
+dist_levels <- levels(mf_s$distance_f)
+
+t_seq <- seq(min(mf_s$time_since_death_years, na.rm = TRUE),
+             max(mf_s$time_since_death_years, na.rm = TRUE),
+             length.out = 200)
+
+s_grid <- tidyr::expand_grid(
+  time_since_death_years = t_seq,
+  distance_f = factor(as.character(dist_keep), levels = dist_levels)
+) %>%
+  mutate(
+    distance_m = as.numeric(as.character(distance_f)),  # for labels
+    habitat_moist3 = make_col(mf_s, "habitat_moist3", ref_hab_s, n()),
+    carcass_size   = make_col(mf_s, "carcass_size",  ref_size_s, n())
+  )
+
+s_pred <- pred_ci_cloglog(m_soil, s_grid)
+
+s_pred <- s_pred %>%
+  mutate(
+    distance_lab = ifelse(distance_m %% 1 == 0,
+                          paste0(as.integer(distance_m), "m"),
+                          paste0(distance_m, "m")),
+    distance_lab = factor(distance_lab,
+                          levels = unique(distance_lab[order(distance_m)]))
+  )
+
+ggplot(s_pred, aes(x = time_since_death_years, y = p,
+                   color = distance_lab, fill = distance_lab, group = distance_lab)) +
+  geom_ribbon(aes(ymin = p_lo, ymax = p_hi), alpha = 0.18, color = NA) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ distance_lab, nrow = 1) +
+  labs(
+    x = "Years since death",
+    y = "Predicted P(culture+)",
+    title = "Predicted Soil Culture Positivity Over Time by Distance from Carcass Center",
+    color = "Distance (m)",
+    fill  = "Distance (m)"
+  ) +
+  coord_cartesian(ylim = c(0, 1)) +
+  theme(legend.position = "none")
+
+#Nicer Figure Coding#
+prep_distance_labels <- function(pred_df, distance_var = "distance_m") {
+  stopifnot(distance_var %in% names(pred_df))
+
+  x <- pred_df[[distance_var]]
+
+  x_num <- suppressWarnings(as.numeric(as.character(x)))
+  if (all(is.na(x_num))) {
+    stop("Couldn't coerce ", distance_var, " to numeric. Check what's in that column.")
+  }
+
+  levs <- sort(unique(x_num))
+  pred_df %>%
+    mutate(
+      distance_lab = factor(
+        paste0(x_num, "m"),
+        levels = paste0(levs, "m")
+      )
+    )
+}
+
+plot_pred_curves_faceted <- function(pred_df, title, subtitle = NULL, caption = NULL, ncol = 3) {
+  ggplot(pred_df, aes(x = time_since_death_years, y = p,
+                      color = distance_lab, fill = distance_lab)) +
+    geom_ribbon(aes(ymin = p_lo, ymax = p_hi), alpha = 0.20, linewidth = 0) +
+    geom_line(linewidth = 0.9) +
+    facet_wrap(~ distance_lab, ncol = ncol) +
+    scale_y_continuous(
+      limits = c(0, 1),
+      breaks = seq(0, 1, by = 0.25),
+      labels = label_number(accuracy = 0.01)
+    ) +
+    scale_x_continuous(expand = expansion(mult = c(0.01, 0.01))) +
+    guides(color = "none", fill = "none") +
+    labs(
+      x = "Years Since Death",
+      y = "Predicted P(Culture+)",
+      title = title,
+      subtitle = subtitle,
+      caption = caption
+    ) +
+    theme_pub
+}
+#Nicer Tissue Plot#
+p_tiss_pub <- ggplot(t_pred, aes(x = time_since_death_years, y = p)) +
+  geom_ribbon(aes(ymin = p_lo, ymax = p_hi), alpha = 0.20, linewidth = 0) +
+  geom_line(linewidth = 0.9) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.25),
+    labels = label_number(accuracy = 0.01)
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.01, 0.01))) +
+  labs(
+    x = "Years Since Death",
+    y = "Predicted P(Culture+)",
+    title = "Predicted Tissue Culture Positivity Over Time, Large Carcasses"
+  ) +
+  theme_pub
+
+p_tiss_pub
+
+#Nicer Soil Plots#
+s_pred_pub <- prep_distance_labels(s_pred, distance_var = "distance_m")
+
+p_soil_pub <- plot_pred_curves_faceted(
+  s_pred_pub,
+  title = "Predicted Soil Culture Positivity Over Time by Distance from Carcass Center",
+  subtitle = NULL,
+  ncol = 2
+)
+
+p_soil_pub
+```
+
+
+# GLMM Models
+## Setup & Model Fitting
+```{r, GLMM Models, cache=FALSE}
+
+library(glmmTMB)
+library(broom.mixed)
+library(DHARMa)
+library(ggeffects)
+
+#Collapse habitat_class -> 3-level moisture class#
+make_habitat_moist3 <- function(habitat_class) {
+  case_when(
+    habitat_class %in% c("Tundra Barrens") ~ "Dry",
+    habitat_class %in% c("Hummock Tundra", "Tundra Meadow") ~ "Medium",
+    habitat_class %in% c("Riverbed", "Riparian Tundra", "Tundra Wetland") ~ "Wet",
+    TRUE ~ NA_character_
+  )
+}
+
+#Filter and Recode Data#
+dat0 <- dat %>%
+  filter(
+    carcass_association == "Y",
+    substrate %in% c("Tissue", "Soil"),
+    !is.na(carcass_id)
+  ) %>%
+  mutate(
+    # outcomes at sample-level (we’ll collapse to visits below)
+    cult_pos   = if_else(culture_done == "Y", culture_ac_pos == "Y", NA),  # TRUE/FALSE/NA
+    pcr_pos    = if_else(pcr_done == "Y", pcr_ac_pos == "Y", NA),         # TRUE/FALSE/NA
+    detect_pos = case_when(
+      culture_done == "Y" & culture_ac_pos == "Y" ~ TRUE,                 # culture positive
+      culture_done == "Y" & culture_ac_pos != "Y" & pcr_done == "Y" & pcr_ac_pos == "Y" ~ TRUE,  # culture neg + PCR pos
+      culture_done == "Y" & culture_ac_pos != "Y" & pcr_done == "Y" & (is.na(pcr_ac_pos) | pcr_ac_pos != "Y") ~ FALSE, # culture neg + PCR done (neg)
+      culture_done == "Y" & culture_ac_pos == "Y" & pcr_done != "Y" ~ TRUE, # culture pos, PCR not done
+      culture_done == "Y" & culture_ac_pos != "Y" & pcr_done != "Y" ~ NA,   # culture neg, PCR not done => unknown detectability
+      culture_done != "Y" & pcr_done == "Y" ~ (pcr_ac_pos == "Y"),          # no culture, PCR only
+      TRUE ~ NA
+    ),
+    habitat_moist3 = make_habitat_moist3(habitat_class),
+    habitat_moist3 = factor(habitat_moist3, levels = c("Dry", "Medium", "Wet")),
+    carcass_size   = factor(carcass_size, levels = c(1, 2), labels = c("Small", "Large")),
+    year_of_death  = as.numeric(year_of_death),
+    sample_year    = as.numeric(sample_year)
+  )
+
+#Collapse to "Visits"#
+tiss_vis <- dat0 %>%
+  filter(substrate == "Tissue") %>%
+  group_by(carcass_id, time_since_death_years) %>%
+  summarise(
+    y_cult   = if_else(any(culture_done == "Y"), as.integer(any(culture_ac_pos == "Y", na.rm = TRUE)), NA_integer_),
+    y_detect = if_else(any(culture_done == "Y" | pcr_done == "Y"), as.integer(any(detect_pos == TRUE, na.rm = TRUE)), NA_integer_),
+    carcass_size   = first(na.omit(carcass_size)),
+    habitat_moist3 = first(na.omit(habitat_moist3)),
+    year_of_death  = first(na.omit(year_of_death)),
+    sample_year    = first(na.omit(sample_year)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    time_c = time_since_death_years - mean(time_since_death_years, na.rm = TRUE),
+    year_c = year_of_death - mean(year_of_death, na.rm = TRUE)
+  )
+
+soil_vis <- dat0 %>%
+  filter(substrate == "Soil") %>%
+  group_by(carcass_id, distance_m, time_since_death_years) %>%
+  summarise(
+    y_cult   = if_else(any(culture_done == "Y"), as.integer(any(culture_ac_pos == "Y", na.rm = TRUE)), NA_integer_),
+    y_detect = if_else(any(culture_done == "Y" | pcr_done == "Y"), as.integer(any(detect_pos == TRUE, na.rm = TRUE)), NA_integer_),
+    carcass_size   = first(na.omit(carcass_size)),
+    habitat_moist3 = first(na.omit(habitat_moist3)),
+    year_of_death  = first(na.omit(year_of_death)),
+    sample_year    = first(na.omit(sample_year)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    time_c = time_since_death_years - mean(time_since_death_years, na.rm = TRUE),
+    dist_c = distance_m - mean(distance_m, na.rm = TRUE),
+    year_c = year_of_death - mean(year_of_death, na.rm = TRUE),
+    distance_f = factor(distance_m, levels = c(0,1,3,5,15))
+  )
+
+link_fun <- "logit"
+
+#Subset Soil Distances to 0m-5m to avoid model separation and avoid confusion with uphill/downhill gradient#
+soil_vis2 <- soil_vis %>%
+  mutate(
+    distance_f = factor(distance_m, levels = c(0, 1, 3, 5))
+  )
+
+#####################
+#####FULL MODELS#####
+#####################
+
+###TISSUE VIABILITY MODEL###
+m_tiss_cult <- glmmTMB(
+  y_cult ~ time_c + carcass_size + habitat_moist3 + (1 | carcass_id),
+  family = binomial(link = link_fun),
+  data   = tiss_vis %>% filter(!is.na(y_cult), !is.na(time_c), !is.na(carcass_size), !is.na(habitat_moist3))
+)
+
+###TISSUE DETECTABILITY MODEL###
+m_tiss_det <- glmmTMB(
+  y_detect ~ time_c + carcass_size + habitat_moist3 + (1 | carcass_id),
+  family = binomial(link = link_fun),
+  data   = tiss_vis %>% filter(!is.na(y_detect), !is.na(time_c), !is.na(carcass_size), !is.na(habitat_moist3))
+)
+
+###SOIL VIABILITY MODELS###
+m_soil_cult <- glmmTMB(
+  y_cult ~ time_c + distance_f + carcass_size + habitat_moist3 + (1 | carcass_id),
+  family = binomial(link = link_fun),
+  data   = soil_vis %>% filter(!is.na(y_cult), !is.na(time_c), !is.na(distance_f), !is.na(carcass_size), !is.na(habitat_moist3))
+)
+
+#with time*dist interaction#
+m_soil_cult_timedist <- update(m_soil_cult, . ~ . + time_c:distance_f)
+
+#distances limited to 0-5m#
+m_soil_cult_df <- glmmTMB(
+  y_cult ~ time_c + distance_f + carcass_size + habitat_moist3 + (1 | carcass_id),
+  family = binomial(link = link_fun),
+  data = soil_vis2 %>%
+    filter(!is.na(y_cult), !is.na(time_c), !is.na(distance_f),
+           !is.na(carcass_size), !is.na(habitat_moist3))
+)
+
+#distance limited with time*dist interaction#
+m_soil_cult_df_timedist <- update(m_soil_cult_df, . ~ . + time_c:distance_f)
+
+###SOIL DETECTABILITY MODELS###
+m_soil_det <- glmmTMB(
+  y_detect ~ time_c + distance_f + carcass_size + habitat_moist3 + (1 | carcass_id),
+  family = binomial(link = link_fun),
+  data   = soil_vis %>% filter(!is.na(y_detect), !is.na(time_c), !is.na(distance_f), !is.na(carcass_size), !is.na(habitat_moist3))
+)
+
+#with time*dist interaction#
+m_soil_det_timedist <- update(m_soil_det, . ~ . + time_c:distance_f)
+
+#distances limited to 0-5m#
+m_soil_det_df <- glmmTMB(
+  y_detect ~ time_c + distance_f + carcass_size + habitat_moist3 + (1 | carcass_id),
+  family = binomial(link = link_fun),
+  data = soil_vis2 %>%
+    filter(!is.na(y_detect), !is.na(time_c), !is.na(distance_f),
+           !is.na(carcass_size), !is.na(habitat_moist3))
+)
+
+#distance limited with time*dist interaction#
+m_soil_det_df_timedist <- update(m_soil_det_df, . ~ . + time_c:distance_f)
+
+print(m_tiss_cult)
+print(m_tiss_det)
+print(m_soil_cult)
+print(m_soil_cult_timedist)
+print(m_soil_cult_df)
+print(m_soil_cult_df_timedist)
+print(m_soil_det)
+print(m_soil_det_timedist)
+print(m_soil_det_df)
+print(m_soil_det_df_timedist)
+
+###MODEL DIAGNOSTICS###
+sim_tiss_cult <- simulateResiduals(m_tiss_cult); plot(sim_tiss_cult)
+sim_tiss_det  <- simulateResiduals(m_tiss_det);  plot(sim_tiss_det)
+sim_soil_cult <- simulateResiduals(m_soil_cult); plot(sim_soil_cult)
+sim_soil_cult_timedist <- simulateResiduals(m_soil_cult_timedist); plot(sim_soil_cult_timedist)
+sim_soil_cult_df <- simulateResiduals(m_soil_cult_df); plot(sim_soil_cult_df)
+sim_soil_cult_df_timedist <- simulateResiduals(m_soil_cult_df_timedist); plot(sim_soil_cult_df_timedist)
+sim_soil_det  <- simulateResiduals(m_soil_det);  plot(sim_soil_det)
+sim_soil_det_timedist <- simulateResiduals(m_soil_det_timedist);  plot(sim_soil_det_timedist)
+sim_soil_det_df <- simulateResiduals(m_soil_det_df); plot(sim_soil_det_df)
+sim_soil_det_df_timedist <- simulateResiduals(m_soil_det_df_timedist); plot(sim_soil_det_df_timedist)
+
+###MODEL TABLES###
+tidy_or <- function(m, model_name) {
+  broom.mixed::tidy(m, effects = "fixed", conf.int = TRUE, conf.method = "Wald") %>%
+    mutate(
+      model = model_name,
+      OR    = exp(estimate),
+      OR_lo = exp(conf.low),
+      OR_hi = exp(conf.high)
+    ) %>%
+    dplyr::select(model, term, estimate, std.error, statistic, p.value, OR, OR_lo, OR_hi)
+}
+
+tab_models <- bind_rows(
+  tidy_or(m_tiss_cult, "Tissue | Viability (culture+)"),
+  tidy_or(m_tiss_det,  "Tissue | Detectability (culture or PCR+)"),
+  tidy_or(m_soil_cult, "Soil   | Viability (culture+)"),
+  tidy_or(m_soil_cult_timedist, "Soil   | Viability (culture+) w/ Time*Dist Interaction"),
+  tidy_or(m_soil_cult_df, "Soil   | Viability (culture+) w/ Limited Distances"),
+  tidy_or(m_soil_cult_df_timedist, "Soil   | Viability (culture+) w/ Limited Distances & Time*Dist Interaction"),
+  tidy_or(m_soil_det,  "Soil   | Detectability (culture or PCR+)"),
+  tidy_or(m_soil_det_timedist,  "Soil   | Detectability (culture or PCR+) w/Time*Dist Interaction"),
+  tidy_or(m_soil_det_df, "Soil   | Detectability (culture or PCR+) w/ Limited Distances"),
+  tidy_or(m_soil_det_df_timedist, "Soil   | Detectability (culture or PCR+) w/ Limited Distances & Time*Dist Interaction")
+)
+
+tab_models %>% print(n = Inf)
+
+tab_models_int <- bind_rows(
+  tidy_or(m_soil_cult_df_timedist, "Soil   | Viability (culture+) w/ Limited Distances & Time*Dist Interaction"),
+  tidy_or(m_soil_det_df_timedist, "Soil   | Detectability (culture or PCR+) w/ Limited Distances & Time*Dist Interaction")
+)
+
+tab_models_int %>% print(n = Inf)
+
+tab_models_chosen <- bind_rows(
+  tidy_or(m_tiss_cult, "Tissue | Viability (culture+)"),
+  tidy_or(m_tiss_det,  "Tissue | Detectability (culture or PCR+)"),
+  tidy_or(m_soil_cult_df, "Soil   | Viability (culture+) w/ Limited Distances"),
+  tidy_or(m_soil_det_df, "Soil   | Detectability (culture or PCR+) w/ Limited Distances"))
+
+tab_models_chosen %>% print(n = Inf)
+
+##########################
+##### NO-TIME MODELS #####
+##########################
+
+#Build no-time visit tables#
+tiss_vis_nt <- dat0 %>%
+  filter(substrate == "Tissue") %>%
+  group_by(carcass_id, sample_year) %>%
+  summarise(
+    y_cult   = if_else(any(culture_done == "Y"),
+                       as.integer(any(culture_ac_pos == "Y", na.rm = TRUE)),
+                       NA_integer_),
+    y_detect = if_else(any(culture_done == "Y" | pcr_done == "Y"),
+                       as.integer(any(detect_pos == TRUE, na.rm = TRUE)),
+                       NA_integer_),
+    carcass_size   = first(na.omit(carcass_size)),
+    habitat_moist3 = first(na.omit(habitat_moist3)),
+    .groups = "drop"
+  )
+
+soil_vis_nt <- dat0 %>%
+  filter(substrate == "Soil") %>%
+  group_by(carcass_id, sample_year, distance_m) %>%
+  summarise(
+    y_cult   = if_else(any(culture_done == "Y"),
+                       as.integer(any(culture_ac_pos == "Y", na.rm = TRUE)),
+                       NA_integer_),
+    y_detect = if_else(any(culture_done == "Y" | pcr_done == "Y"),
+                       as.integer(any(detect_pos == TRUE, na.rm = TRUE)),
+                       NA_integer_),
+    carcass_size   = first(na.omit(carcass_size)),
+    habitat_moist3 = first(na.omit(habitat_moist3)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    distance_f = factor(distance_m, levels = c(0, 1, 3, 5, 15))
+  )
+
+soil_vis_nt_df <- soil_vis_nt %>%
+  filter(distance_m %in% c(0, 1, 3, 5)) %>%
+  mutate(distance_f = factor(distance_m, levels = c(0, 1, 3, 5)))
+
+### TISSUE VIABILITY (NO TIME) ###
+m_tiss_cult_nt <- glmmTMB(
+  y_cult ~ carcass_size + habitat_moist3 + (1 | carcass_id),
+  family = binomial(link = link_fun),
+  data = tiss_vis_nt %>%
+    filter(!is.na(y_cult),
+           !is.na(carcass_size),
+           !is.na(habitat_moist3))
+)
+
+### TISSUE DETECTABILITY (NO TIME) ###
+m_tiss_det_nt <- glmmTMB(
+  y_detect ~ carcass_size + habitat_moist3 + (1 | carcass_id),
+  family = binomial(link = link_fun),
+  data = tiss_vis_nt %>%
+    filter(!is.na(y_detect),
+           !is.na(carcass_size),
+           !is.na(habitat_moist3))
+)
+
+### SOIL VIABILITY (NO TIME) ###
+m_soil_cult_nt_df <- glmmTMB(
+  y_cult ~ distance_f + carcass_size + habitat_moist3 + (1 | carcass_id),
+  family = binomial(link = link_fun),
+  data = soil_vis_nt_df %>%
+    filter(!is.na(y_cult),
+           !is.na(distance_f),
+           !is.na(carcass_size),
+           !is.na(habitat_moist3))
+)
+
+### SOIL DETECTABILITY (NO TIME) ###
+m_soil_det_nt_df <- glmmTMB(
+  y_detect ~ distance_f + carcass_size + habitat_moist3 + (1 | carcass_id),
+  family = binomial(link = link_fun),
+  data = soil_vis_nt_df %>%
+    filter(!is.na(y_detect),
+           !is.na(distance_f),
+           !is.na(carcass_size),
+           !is.na(habitat_moist3))
+)
+
+
+print(m_tiss_cult_nt)
+print(m_tiss_det_nt)
+print(m_soil_cult_nt_df)
+print(m_soil_det_nt_df)
+
+#NO TIME CARCASS SITES AND VISITS USED#
+model_counts <- bind_rows(
+  tiss_vis_nt %>%
+    filter(!is.na(y_cult), !is.na(carcass_size), !is.na(habitat_moist3)) %>%
+    summarise(model = "Tissue viability (no time)",
+              visits = n(),
+              carcass_sites = n_distinct(carcass_id)),
+  tiss_vis_nt %>%
+    filter(!is.na(y_detect), !is.na(carcass_size), !is.na(habitat_moist3)) %>%
+    summarise(model = "Tissue detectability (no time)",
+              visits = n(),
+              carcass_sites = n_distinct(carcass_id)),
+  soil_vis_nt_df %>%
+    filter(!is.na(y_cult), !is.na(distance_f), !is.na(carcass_size), !is.na(habitat_moist3)) %>%
+    summarise(model = "Soil viability 0–5 m (no time)",
+              visits = n(),
+              carcass_sites = n_distinct(carcass_id)),
+  soil_vis_nt_df %>%
+    filter(!is.na(y_detect), !is.na(distance_f), !is.na(carcass_size), !is.na(habitat_moist3)) %>%
+    summarise(model = "Soil detectability 0–5 m (no time)",
+              visits = n(),
+              carcass_sites = n_distinct(carcass_id))
+)
+
+model_counts
+
+#NO TIME MODEL TABLES#
+
+tidy_or <- function(m, model_name) {
+  broom.mixed::tidy(m, effects = "fixed", conf.int = TRUE, conf.method = "Wald") %>%
+    mutate(
+      model = model_name,
+      OR    = exp(estimate),
+      OR_lo = exp(conf.low),
+      OR_hi = exp(conf.high)
+    ) %>%
+    dplyr::select(model, term, estimate, std.error, statistic, p.value, OR, OR_lo, OR_hi)
+}
+
+tab_models_nt <- bind_rows(
+  tidy_or(m_tiss_cult_nt,    "Tissue viability (no time)"),
+  tidy_or(m_tiss_det_nt,     "Tissue detectability (no time)"),
+  tidy_or(m_soil_cult_nt_df, "Soil viability 0–5 m (no time)"),
+  tidy_or(m_soil_det_nt_df,  "Soil detectability 0–5 m (no time)")
+)
+
+print(tab_models_nt, n=Inf)
+```
+
+## Soil Predicted-Curve Plots
+```{r, GLMM Models: Soil Predicted-Curve Plots, cache=FALSE}
+
+library(patchwork)
+
+#Build plotting dataset#
+soil_plot_dat <- soil_vis2 %>%
+  filter(
+    distance_m %in% c(0, 1, 3, 5),
+    !is.na(time_since_death_years),
+    !is.na(time_c),
+    !is.na(distance_f),
+    !is.na(carcass_size),
+    !is.na(habitat_moist3)
+  )
+
+#Pull most common fixed-effect levels#
+mf_s_glmm <- model.frame(m_soil_cult_df)
+
+ref_hab_s_glmm  <- names(sort(table(mf_s_glmm$habitat_moist3), decreasing = TRUE))[1]
+ref_size_s_glmm <- names(sort(table(mf_s_glmm$carcass_size),  decreasing = TRUE))[1]
+
+#Time sequence from plotting data#
+t_seq_glmm <- seq(
+  min(soil_plot_dat$time_since_death_years, na.rm = TRUE),
+  max(soil_plot_dat$time_since_death_years, na.rm = TRUE),
+  length.out = 200
+)
+
+t_mean_glmm <- mean(soil_plot_dat$time_since_death_years, na.rm = TRUE)
+
+#Prediction grid#
+soil_pred_grid <- tidyr::expand_grid(
+  time_since_death_years = t_seq_glmm,
+  distance_f = factor(c(0, 1, 3, 5), levels = c(0, 1, 3, 5))
+) %>%
+  mutate(
+    time_c         = time_since_death_years - t_mean_glmm,
+    habitat_moist3 = factor(ref_hab_s_glmm,  levels = levels(mf_s_glmm$habitat_moist3)),
+    carcass_size   = factor(ref_size_s_glmm, levels = levels(mf_s_glmm$carcass_size))
+  )
+
+#Get population-level predicted probabilities + 95% CI#
+predict_glmm_curve <- function(model, newdata, outcome_label) {
+  pr <- predict(
+    model,
+    newdata = newdata,
+    type    = "link",
+    se.fit  = TRUE,
+    re.form = NA
+  )
+
+  out <- newdata %>%
+    mutate(
+      eta     = as.numeric(pr$fit),
+      se      = as.numeric(pr$se.fit),
+      p       = plogis(eta),
+      p_lo    = plogis(eta - 1.96 * se),
+      p_hi    = plogis(eta + 1.96 * se),
+      outcome = outcome_label
+    )
+
+  prep_distance_labels(out, distance_var = "distance_f")
+}
+
+#Predictions#
+soil_pred_viab <- predict_glmm_curve(
+  m_soil_cult_df,
+  soil_pred_grid,
+  "Viability"
+)
+
+soil_pred_det <- predict_glmm_curve(
+  m_soil_det_df,
+  soil_pred_grid,
+  "Detectability"
+)
+
+#Panel plotting#
+plot_glmm_soil_panel <- function(pred_df, ylab_text, panel_title = NULL) {
+  ggplot(
+    pred_df,
+    aes(
+      x = time_since_death_years,
+      y = p,
+      color = distance_lab,
+      fill  = distance_lab
+    )
+  ) +
+    geom_ribbon(aes(ymin = p_lo, ymax = p_hi), alpha = 0.18, linewidth = 0) +
+    geom_line(linewidth = 0.9) +
+    facet_wrap(~ distance_lab, nrow = 1) +
+    scale_y_continuous(
+      limits = c(0, 1),
+      breaks = seq(0, 1, by = 0.25),
+      labels = label_number(accuracy = 0.01)
+    ) +
+    scale_x_continuous(
+      expand = expansion(mult = c(0.01, 0.01))
+    ) +
+    guides(color = "none", fill = "none") +
+    labs(
+      x = "Years Since Death",
+      y = ylab_text,
+      title = panel_title
+    ) +
+    theme_pub
+}
+
+p_soil_glmm_viab <- plot_glmm_soil_panel(
+  soil_pred_viab,
+  ylab_text  = "Predicted P(Culture+)",
+  panel_title = "Predicted Soil Viability Over Time"
+)
+
+p_soil_glmm_viab
+
+p_soil_glmm_det <- plot_glmm_soil_panel(
+  soil_pred_det,
+  ylab_text  = "Predicted P(Culture or PCR+)",
+  panel_title = "Predicted Soil Detectability Over Time"
+)
+
+p_soil_glmm_det
+
+p_soil_glmm_two_panel <- patchwork::wrap_plots(
+  p_soil_glmm_viab,
+  p_soil_glmm_det,
+  ncol = 1
+)
+
+p_soil_glmm_two_panel
+```
+
+##Tissue Predicted-Curve Plots
+```{r, GLMM Models: Tissue Predicted-Curve Plots, cache=FALSE}
+
+library(patchwork)
+
+# Build plotting dataset using the same variables included in the tissue GLMMs
+tiss_plot_dat <- tiss_vis %>%
+  filter(
+    !is.na(time_since_death_years),
+    !is.na(time_c),
+    !is.na(carcass_size),
+    !is.na(habitat_moist3)
+  )
+
+# Pull most common fixed-effect levels from the model frame
+mf_t_glmm <- model.frame(m_tiss_cult)
+
+ref_hab_t_glmm <- names(sort(table(mf_t_glmm$habitat_moist3), decreasing = TRUE))[1]
+ref_size_t_glmm <- names(sort(table(mf_t_glmm$carcass_size), decreasing = TRUE))[1]
+
+# Time sequence from tissue plotting data
+t_seq_tiss_glmm <- seq(
+  min(tiss_plot_dat$time_since_death_years, na.rm = TRUE),
+  max(tiss_plot_dat$time_since_death_years, na.rm = TRUE),
+  length.out = 200
+)
+
+t_mean_tiss_glmm <- mean(tiss_plot_dat$time_since_death_years, na.rm = TRUE)
+
+# Prediction grid at most common reference categories
+tiss_pred_grid <- tibble::tibble(
+  time_since_death_years = t_seq_tiss_glmm,
+  time_c = time_since_death_years - t_mean_tiss_glmm,
+  habitat_moist3 = factor(
+    ref_hab_t_glmm,
+    levels = levels(mf_t_glmm$habitat_moist3)
+  ),
+  carcass_size = factor(
+    ref_size_t_glmm,
+    levels = levels(mf_t_glmm$carcass_size)
+  )
+)
+
+# General GLMM prediction helper for tissue curves
+predict_glmm_tissue_curve <- function(model, newdata, outcome_label) {
+  pr <- predict(
+    model,
+    newdata = newdata,
+    type    = "link",
+    se.fit  = TRUE,
+    re.form = NA
+  )
+
+  newdata %>%
+    mutate(
+      eta     = as.numeric(pr$fit),
+      se      = as.numeric(pr$se.fit),
+      p       = plogis(eta),
+      p_lo    = plogis(eta - 1.96 * se),
+      p_hi    = plogis(eta + 1.96 * se),
+      outcome = outcome_label
+    )
+}
+
+# Predictions
+tiss_pred_viab <- predict_glmm_tissue_curve(
+  m_tiss_cult,
+  tiss_pred_grid,
+  "Viability"
+)
+
+tiss_pred_det <- predict_glmm_tissue_curve(
+  m_tiss_det,
+  tiss_pred_grid,
+  "Detectability"
+)
+
+# Panel plotting function
+plot_glmm_tissue_panel <- function(pred_df, ylab_text, panel_title = NULL) {
+  ggplot(pred_df, aes(x = time_since_death_years, y = p)) +
+    geom_ribbon(aes(ymin = p_lo, ymax = p_hi), alpha = 0.18, linewidth = 0) +
+    geom_line(linewidth = 0.9) +
+    scale_y_continuous(
+      limits = c(0, 1),
+      breaks = seq(0, 1, by = 0.25),
+      labels = scales::label_number(accuracy = 0.01)
+    ) +
+    scale_x_continuous(
+      expand = expansion(mult = c(0.01, 0.01))
+    ) +
+    labs(
+      x = "Years Since Death",
+      y = ylab_text,
+      title = panel_title
+    ) +
+    theme_pub
+}
+
+# Individual panels
+p_tiss_glmm_viab <- plot_glmm_tissue_panel(
+  tiss_pred_viab,
+  ylab_text = "Predicted P(Culture+)",
+  panel_title = "Predicted Tissue Viability Over Time"
+)
+
+p_tiss_glmm_det <- plot_glmm_tissue_panel(
+  tiss_pred_det,
+  ylab_text = "Predicted P(Culture or PCR+)",
+  panel_title = "Predicted Tissue Detectability Over Time"
+)
+
+# Side-by-side figure
+p_tiss_glmm_two_panel <- patchwork::wrap_plots(
+  p_tiss_glmm_viab,
+  p_tiss_glmm_det,
+  ncol = 2
+)
+
+p_tiss_glmm_two_panel
+
+ggsave(
+  filename = "Tissue Predicted Curves.png",
+  plot = p_tiss_glmm_two_panel,
+  width = 10,
+  height = 5,
+  dpi = 600
+)
+
+```
+# Soil Chemistry Analyses
+## Data Setup
+```{r, Soil Chemistry: Data Setup, cache=FALSE}
+library(tidyr)
+library(vegan)
+library(tibble)
+library(purrr)
+library(glmmTMB)
+library(broom.mixed)
+library(ggplot2)
+
+# Habitat Moisture Classes 
+make_habitat_moist3 <- function(x) {
+  x <- as.character(x)
+  out <- dplyr::case_when(
+    x == "Tundra Barrens" ~ "Dry",
+    x %in% c("Hummock Tundra", "Tundra Meadow") ~ "Medium",
+    x %in% c("Riparian Tundra", "Riverbed", "Tundra Wetland") ~ "Wet",
+    TRUE ~ NA_character_
+  )
+
+  factor(out, levels = c("Dry", "Medium", "Wet"))
+}
+
+# Soil chemistry variables
+chem_vars_raw <- c(
+  "soil_moisture",
+  "soil_water_hold_cap",
+  "soil_pH",
+  "soil_soluble_C",
+  "soil_soluble_orgC",
+  "soil_soluble_inorgC",
+  "soil_N",
+  "soil_CN_ratio",
+  "soil_Cl",
+  "soil_K",
+  "soil_P"
+)
+
+# Variables to log-adjust prior to multivariate / delta work 
+log_vars <- c(
+  "soil_water_hold_cap",
+  "soil_soluble_C",
+  "soil_soluble_orgC",
+  "soil_soluble_inorgC",
+  "soil_N",
+  "soil_CN_ratio",
+  "soil_Cl",
+  "soil_K",
+  "soil_P"
+)
+
+# Build raw paired soil chemistry dataset
+soil_chem <- dat %>%
+  filter(
+    carcass_association == "Y",
+    substrate == "Soil",
+    sample_year %in% c(2023, 2024),
+    distance_m %in% c(0, 15)
+  ) %>%
+  filter(if_any(all_of(chem_vars_raw), ~ !is.na(.x))) %>%
+  mutate(
+    sample_year = as.integer(sample_year),
+    distance_m = as.integer(distance_m),
+    carcass_id = as.character(carcass_id),
+    sample_id = as.character(sample_id),
+    habitat_class = as.character(habitat_class),
+    habitat_moist3 = make_habitat_moist3(habitat_class),
+    distance_lab = factor(ifelse(distance_m == 0, "0m", "15m"),
+                          levels = c("0m", "15m"))
+  )
+
+# Apply log1p transformations
+soil_chem_tr <- soil_chem %>%
+  mutate(
+    across(all_of(log_vars), log1p, .names = "{.col}_log")
+  )
+
+# Variables used in multivariate analyses
+chem_vars_use <- c(
+  "soil_moisture",
+  "soil_water_hold_cap_log",
+  "soil_pH",
+  "soil_soluble_C_log",
+  "soil_soluble_orgC_log",
+  "soil_soluble_inorgC_log",
+  "soil_N_log",
+  "soil_CN_ratio_log",
+  "soil_Cl_log",
+  "soil_K_log",
+  "soil_P_log"
+)
+
+# Standardize transformed raw paired dataset
+soil_chem_std <- soil_chem_tr %>%
+  drop_na(all_of(chem_vars_use)) %>%
+  mutate(
+    across(
+      all_of(chem_vars_use),
+      ~ as.numeric(scale(.x)),
+      .names = "{.col}_z"
+    )
+  )
+
+chem_vars_z <- paste0(chem_vars_use, "_z")
+
+# Pairwise PERMANOVA helper function
+pairwise_permanova <- function(df, group_var, vars_z, strata_var = NULL,
+                               nperm = 9999) {
+
+  groups <- levels(droplevels(factor(df[[group_var]])))
+  comps  <- combn(groups, 2, simplify = FALSE)
+
+  out <- map_dfr(comps, function(cc) {
+
+    dsub <- df %>%
+      filter(.data[[group_var]] %in% cc) %>%
+      mutate(.grp = droplevels(factor(.data[[group_var]])))
+
+    X <- as.matrix(dsub[, vars_z])
+
+    fit <- adonis2(
+      X ~ .grp,
+      data = dsub,
+      method = "euclidean",
+      permutations = nperm,
+      strata = if (!is.null(strata_var)) dsub[[strata_var]] else NULL
+    )
+
+    tibble(
+      group1  = cc[1],
+      group2  = cc[2],
+      n       = nrow(dsub),
+      F_model = fit$F[1],
+      R2      = fit$R2[1],
+      p       = fit$`Pr(>F)`[1]
+    )
+  })
+
+  out %>%
+    mutate(p_adj_BH = p.adjust(p, method = "BH")) %>%
+    arrange(p_adj_BH, p)
+}
+
+# Global PERMANOVA + dispersion wrapper
+run_perm_suite <- function(df, group_var, vars_z, strata_var = NULL,
+                           nperm = 9999) {
+
+  df <- df %>%
+    filter(!is.na(.data[[group_var]])) %>%
+    mutate(.grp = droplevels(factor(.data[[group_var]])))
+
+  X <- as.matrix(df[, vars_z])
+  D <- vegdist(X, method = "euclidean")
+
+  perm <- adonis2(
+    X ~ .grp,
+    data = df,
+    method = "euclidean",
+    permutations = nperm,
+    strata = if (!is.null(strata_var)) df[[strata_var]] else NULL
+  )
+
+  bd <- betadisper(D, group = df$.grp, type = "centroid")
+  bd_perm <- permutest(bd, permutations = nperm)
+
+  pw_perm <- pairwise_permanova(
+    df = df,
+    group_var = group_var,
+    vars_z = vars_z,
+    strata_var = strata_var,
+    nperm = nperm
+  )
+
+  list(
+    permanova = perm,
+    permdisp = bd_perm,
+    betadisper = bd,
+    pairwise_permanova = pw_perm
+  )
+}
+
+# Build paired dataset for deltas
+
+soil_pairs <- soil_chem_tr %>%
+  dplyr::select(
+    carcass_id, sample_year, time_since_death_years,
+    habitat_moist3, distance_lab, all_of(chem_vars_use)
+  ) %>%
+  pivot_wider(
+    names_from  = distance_lab,
+    values_from = all_of(chem_vars_use),
+    names_sep   = "_"
+  ) %>%
+  mutate(
+    years_since_death_f = case_when(
+      time_since_death_years == 2 ~ "2y",
+      time_since_death_years == 3 ~ "3y",
+      TRUE ~ NA_character_
+    ),
+    years_since_death_f = factor(years_since_death_f, levels = c("2y", "3y"))
+  )
+
+# Absolute delta = 0m - 15m
+for (v in chem_vars_use) {
+  soil_pairs[[paste0("delta_", v)]] <-
+    soil_pairs[[paste0(v, "_0m")]] - soil_pairs[[paste0(v, "_15m")]]
+}
+
+# Percentage delta = ((0m - 15m) / 15m) * 100
+for (v in chem_vars_use) {
+  denom <- soil_pairs[[paste0(v, "_15m")]]
+
+  soil_pairs[[paste0("pct_delta_", v)]] <-
+    ifelse(
+      !is.na(denom) & denom != 0,
+      ((soil_pairs[[paste0(v, "_0m")]] - denom) / denom) * 100,
+      NA_real_
+    )
+}
+
+delta_vars_abs <- paste0("delta_", chem_vars_use)
+delta_vars_pct <- paste0("pct_delta_", chem_vars_use)
+
+soil_delta <- soil_pairs
+
+soil_delta_tsd <- soil_delta %>%
+  filter(years_since_death_f %in% c("2y", "3y"))
+
+# Quick checks
+soil_chem %>% count(sample_year, distance_lab)
+soil_chem_std %>% count(sample_year, distance_lab, habitat_moist3)
+soil_delta_tsd %>% count(years_since_death_f, habitat_moist3)
+
+
+```
+
+##Soil Chemistry Sample Summary Data Table##
+```{r, Soil Chemistry: Supplementary Table, cache=FALSE}
+
+library(tidyverse)
+library(stringr)
+library(readr)
+
+#------------------------------------------------------------
+# Formatting helpers
+#------------------------------------------------------------
+
+fmt_n_pct <- function(n, d, digits = 1) {
+  ifelse(
+    is.na(d) | d == 0,
+    "",
+    sprintf(paste0("%d (%.", digits, "f)"), n, 100 * n / d)
+  )
+}
+
+fmt_pos_tested <- function(pos, tested, digits = 1) {
+  ifelse(
+    is.na(tested) | tested == 0,
+    "",
+    sprintf(paste0("%d/%d (%.", digits, "f)"), pos, tested, 100 * pos / tested)
+  )
+}
+
+fmt_n_units <- function(n, units) {
+  ifelse(
+    is.na(n),
+    "",
+    sprintf("%d (%d)", n, units)
+  )
+}
+
+clean_yn <- function(x) {
+  str_to_upper(str_trim(as.character(x)))
+}
+
+#------------------------------------------------------------
+# Build Supplementary Table 7 dataset from soil_chem ONLY
+#------------------------------------------------------------
+
+supp7_dat <- soil_chem %>%
+  mutate(
+    unique_id = as.character(unique_id),
+    site_id = as.character(site_id),
+    carcass_id = as.character(carcass_id),
+    
+    sample_year = as.integer(sample_year),
+    distance_m = as.integer(distance_m),
+    
+    year_of_death = suppressWarnings(as.numeric(year_of_death)),
+    time_since_death_years = suppressWarnings(as.numeric(time_since_death_years)),
+    
+    culture_done_chr = clean_yn(culture_done),
+    culture_ac_pos_chr = clean_yn(culture_ac_pos),
+    pcr_done_chr = clean_yn(pcr_done),
+    pcr_ac_pos_chr = clean_yn(pcr_ac_pos),
+    ac_any_pos_chr = clean_yn(ac_any_pos),
+    
+    distance_lab = case_when(
+      distance_m == 0 ~ "0 m",
+      distance_m == 15 ~ "15 m",
+      TRUE ~ paste0(distance_m, " m")
+    ),
+    
+    culture_tested = culture_done_chr == "Y" | culture_ac_pos_chr %in% c("Y", "N"),
+    culture_pos = culture_ac_pos_chr == "Y",
+    
+    pcr_tested = pcr_done_chr == "Y" | pcr_ac_pos_chr %in% c("Y", "N"),
+    pcr_pos = pcr_ac_pos_chr == "Y",
+    
+    any_tested = culture_tested | pcr_tested,
+    any_pos = case_when(
+      ac_any_pos_chr %in% c("Y", "N") ~ ac_any_pos_chr == "Y",
+      TRUE ~ culture_pos | pcr_pos
+    ),
+    
+    time_known = !is.na(year_of_death) & !is.na(time_since_death_years)
+  ) %>%
+  filter(
+    sample_year %in% c(2023, 2024),
+    distance_m %in% c(0, 15),
+    !is.na(carcass_id),
+    
+    # Critical update:
+    # remove carcasses without known death timing
+    time_known,
+    
+    # Align with the inferential soil chemistry analyses:
+    # 2023 = 2 years since death, 2024 = 3 years since death
+    time_since_death_years %in% c(2, 3)
+  )
+
+#------------------------------------------------------------
+# Diagnostics: confirm what is included/excluded
+#------------------------------------------------------------
+
+supp7_removed_unknown_death <- soil_chem %>%
+  mutate(
+    sample_year = as.integer(sample_year),
+    distance_m = as.integer(distance_m),
+    year_of_death = suppressWarnings(as.numeric(year_of_death)),
+    time_since_death_years = suppressWarnings(as.numeric(time_since_death_years))
+  ) %>%
+  filter(
+    sample_year %in% c(2023, 2024),
+    distance_m %in% c(0, 15),
+    is.na(year_of_death) | is.na(time_since_death_years)
+  ) %>%
+  distinct(
+    carcass_id,
+    site_id,
+    sample_year,
+    distance_m,
+    year_of_death,
+    time_since_death_years
+  ) %>%
+  arrange(carcass_id, sample_year, distance_m)
+
+supp7_removed_unknown_death
+
+supp7_diagnostic <- supp7_dat %>%
+  group_by(distance_lab, sample_year) %>%
+  summarise(
+    samples_n = n(),
+    unique_carcasses_n = n_distinct(carcass_id),
+    known_time_of_death_n = sum(time_known, na.rm = TRUE),
+    
+    culture_pos_n = sum(culture_pos, na.rm = TRUE),
+    culture_tested_n = sum(culture_tested, na.rm = TRUE),
+    
+    pcr_pos_n = sum(pcr_pos, na.rm = TRUE),
+    pcr_tested_n = sum(pcr_tested, na.rm = TRUE),
+    
+    any_pos_n = sum(any_pos, na.rm = TRUE),
+    any_tested_n = sum(any_tested, na.rm = TRUE),
+    
+    .groups = "drop"
+  ) %>%
+  arrange(
+    factor(distance_lab, levels = c("0 m", "15 m")),
+    sample_year
+  )
+
+supp7_diagnostic
+
+#------------------------------------------------------------
+# Summaries by distance-year
+#------------------------------------------------------------
+
+supp7_years <- supp7_dat %>%
+  group_by(distance_lab, sample_year) %>%
+  summarise(
+    samples_n = n(),
+    unique_carcasses_n = n_distinct(carcass_id),
+    time_known_n = sum(time_known, na.rm = TRUE),
+    
+    culture_pos_n = sum(culture_pos, na.rm = TRUE),
+    culture_tested_n = sum(culture_tested, na.rm = TRUE),
+    
+    pcr_pos_n = sum(pcr_pos, na.rm = TRUE),
+    pcr_tested_n = sum(pcr_tested, na.rm = TRUE),
+    
+    any_pos_n = sum(any_pos, na.rm = TRUE),
+    any_tested_n = sum(any_tested, na.rm = TRUE),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(sample_year = as.character(sample_year))
+
+supp7_totals <- supp7_dat %>%
+  group_by(distance_lab) %>%
+  summarise(
+    sample_year = "TOTAL",
+    samples_n = n(),
+    unique_carcasses_n = n_distinct(carcass_id),
+    time_known_n = sum(time_known, na.rm = TRUE),
+    
+    culture_pos_n = sum(culture_pos, na.rm = TRUE),
+    culture_tested_n = sum(culture_tested, na.rm = TRUE),
+    
+    pcr_pos_n = sum(pcr_pos, na.rm = TRUE),
+    pcr_tested_n = sum(pcr_tested, na.rm = TRUE),
+    
+    any_pos_n = sum(any_pos, na.rm = TRUE),
+    any_tested_n = sum(any_tested, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+
+supp7_stats <- bind_rows(
+  supp7_years,
+  supp7_totals
+)
+
+#------------------------------------------------------------
+# Table shell matching Supplementary Table 7 skeleton
+#------------------------------------------------------------
+
+supp7_shell <- tribble(
+  ~distance_lab, ~sample_year,
+  "0 m",  "2023",
+  "0 m",  "2024",
+  "0 m",  "TOTAL",
+  "15 m", "2023",
+  "15 m", "2024",
+  "15 m", "TOTAL"
+)
+
+supp_table_7 <- supp7_shell %>%
+  left_join(
+    supp7_stats,
+    by = c("distance_lab", "sample_year")
+  ) %>%
+  mutate(
+    across(
+      c(
+        samples_n,
+        unique_carcasses_n,
+        time_known_n,
+        culture_pos_n,
+        culture_tested_n,
+        pcr_pos_n,
+        pcr_tested_n,
+        any_pos_n,
+        any_tested_n
+      ),
+      ~ replace_na(.x, 0)
+    ),
+    
+    `Sampling Distance` = distance_lab,
+    Year = sample_year,
+    `Samples, n (Unique Carcasses*)` = fmt_n_units(samples_n, unique_carcasses_n),
+    `Known Time of Death*, n (%)` = fmt_n_pct(time_known_n, samples_n),
+    `Culture + / n Tested (%)` = fmt_pos_tested(culture_pos_n, culture_tested_n),
+    `PCR + / n Tested (%)` = fmt_pos_tested(pcr_pos_n, pcr_tested_n),
+    `Any Test + / n Tested (%)` = fmt_pos_tested(any_pos_n, any_tested_n)
+  ) %>%
+  select(
+    `Sampling Distance`,
+    Year,
+    `Samples, n (Unique Carcasses*)`,
+    `Known Time of Death*, n (%)`,
+    `Culture + / n Tested (%)`,
+    `PCR + / n Tested (%)`,
+    `Any Test + / n Tested (%)`
+  )
+
+supp_table_7
+
+#------------------------------------------------------------
+# Display
+#------------------------------------------------------------
+
+knitr::kable(
+  supp_table_7,
+  caption = "Supplementary Table 7. Summary of soil samples assessed for edaphic factors stratified by sampling distance."
+)
+```
+
+##Model Covariate Summary Table##
+```{r, Covariate Summary Table, cache=FALSE}
+
+library(tidyverse)
+library(stringr)
+library(readr)
+
+# Remove old objects so stale versions cannot be reused
+rm(list = intersect(
+  c(
+    "supp2_source",
+    "supp2_v2_dat",
+    "supp2_v2_rows",
+    "supp_table_2",
+    "supp2_v2_raw_check"
+  ),
+  ls()
+))
+
+#-----------------------------
+# Formatting helpers
+#-----------------------------
+
+fmt_n_pct <- function(n, d, digits = 1) {
+  if (is.na(d) || d == 0) return("")
+  sprintf(paste0("%d (%.", digits, "f)"), n, 100 * n / d)
+}
+
+fmt_pos_tested <- function(pos, tested, digits = 1) {
+  if (is.na(tested) || tested == 0) return("")
+  sprintf(paste0("%d/%d (%.", digits, "f)"), pos, tested, 100 * pos / tested)
+}
+
+fmt_total_n <- function(n) {
+  sprintf("%d (100)", n)
+}
+
+fmt_total_tested <- function(n) {
+  sprintf("/%d (100)", n)
+}
+
+#-----------------------------
+# Use tab_dat if available
+#-----------------------------
+# Since your corrected Table 1 universe is now working, use tab_dat when it exists.
+# Otherwise, fall back to dat and reapply the same filters.
+
+supp2_source <- if (exists("tab_dat")) {
+  tab_dat
+} else {
+  dat
+}
+
+if (!"sample_type" %in% names(supp2_source)) {
+  supp2_source$sample_type <- supp2_source$substrate
+}
+
+#-----------------------------
+# Build sample-level table universe
+#-----------------------------
+
+supp2_v2_dat <- supp2_source %>%
+  mutate(
+    unique_id = as.character(unique_id),
+    site_id = as.character(site_id),
+    carcass_id = as.character(carcass_id),
+    carcass_association = as.character(carcass_association),
+    sample_type = as.character(sample_type),
+    substrate = as.character(substrate),
+    
+    time_since_death_years = suppressWarnings(as.numeric(time_since_death_years)),
+    year_of_death = suppressWarnings(as.numeric(year_of_death)),
+    distance_m = suppressWarnings(as.numeric(distance_m)),
+    
+    culture_done = as.character(culture_done),
+    culture_ac_pos = as.character(culture_ac_pos),
+    pcr_done = as.character(pcr_done),
+    pcr_ac_pos = as.character(pcr_ac_pos),
+    ac_any_pos = as.character(ac_any_pos),
+    
+    carcass_size_chr = as.character(carcass_size),
+    carcass_size_num = suppressWarnings(as.numeric(carcass_size_chr)),
+    habitat_class = as.character(habitat_class)
+  ) %>%
+  filter(
+    carcass_association == "Y",
+    sample_type %in% c("Tissue", "Soil"),
+    !is.na(carcass_id),
+    
+    !str_detect(coalesce(unique_id, ""), "^WOLF-23-01"),
+    !str_detect(coalesce(site_id, ""), "^WOLF-23-01"),
+    !str_detect(coalesce(carcass_id, ""), "^WOLF-23-01")
+  ) %>%
+  mutate(
+    culture_tested = culture_done == "Y" | culture_ac_pos %in% c("Y", "N"),
+    pcr_tested = pcr_done == "Y" | pcr_ac_pos %in% c("Y", "N"),
+    
+    culture_pos = culture_ac_pos == "Y",
+    pcr_pos = pcr_ac_pos == "Y",
+    
+    any_tested = culture_tested | pcr_tested,
+    any_pos = case_when(
+      ac_any_pos %in% c("Y", "N") ~ ac_any_pos == "Y",
+      TRUE ~ culture_pos | pcr_pos
+    ),
+    
+    tsd_cat = case_when(
+      is.na(time_since_death_years) ~ "Unknown",
+      time_since_death_years == 0 ~ "0 years",
+      time_since_death_years == 1 ~ "1 year",
+      time_since_death_years %% 1 == 0 ~ paste0(as.integer(time_since_death_years), " years"),
+      TRUE ~ paste0(time_since_death_years, " years")
+    ),
+    
+    death_year_cat = case_when(
+      is.na(year_of_death) ~ "Unknown",
+      TRUE ~ as.character(as.integer(year_of_death))
+    ),
+    
+    carcass_size_cat = case_when(
+      carcass_size_num == 2 ~ "Large",
+      carcass_size_num == 1 ~ "Small",
+      str_to_lower(carcass_size_chr) %in% c("large", "l") ~ "Large",
+      str_to_lower(carcass_size_chr) %in% c("small", "s") ~ "Small",
+      TRUE ~ "Unknown"
+    ),
+    
+    habitat_moist_cat = case_when(
+      habitat_class == "Tundra Barrens" ~ "Dry",
+      habitat_class %in% c("Hummock Tundra", "Tundra Meadow") ~ "Medium",
+      habitat_class %in% c("Riparian Tundra", "Riverbed", "Tundra Wetland") ~ "Wet",
+      TRUE ~ "Unknown"
+    ),
+    
+    distance_cat = case_when(
+      sample_type != "Soil" ~ NA_character_,
+      is.na(distance_m) ~ "Unknown",
+      distance_m %% 1 == 0 ~ paste0(as.integer(distance_m), " m"),
+      TRUE ~ paste0(distance_m, " m")
+    )
+  )
+
+#-----------------------------
+# Confirm table universe
+#-----------------------------
+
+supp2_v2_universe_check <- supp2_v2_dat %>%
+  summarise(
+    tissue_samples = sum(sample_type == "Tissue"),
+    soil_samples = sum(sample_type == "Soil"),
+    total_samples = n(),
+    carcass_sites = n_distinct(carcass_id),
+    culture_tested = sum(culture_tested, na.rm = TRUE),
+    pcr_tested = sum(pcr_tested, na.rm = TRUE),
+    any_tested = sum(any_tested, na.rm = TRUE)
+  )
+
+supp2_v2_universe_check
+
+stopifnot(supp2_v2_universe_check$tissue_samples == 246)
+stopifnot(supp2_v2_universe_check$soil_samples == 572)
+stopifnot(supp2_v2_universe_check$total_samples == 818)
+stopifnot(supp2_v2_universe_check$carcass_sites == 138)
+stopifnot(supp2_v2_universe_check$culture_tested == 818)
+stopifnot(supp2_v2_universe_check$pcr_tested == 669)
+stopifnot(supp2_v2_universe_check$any_tested == 818)
+
+#-----------------------------
+# Raw diagnostic check
+#-----------------------------
+# This should show:
+# 0 years: Tissue 84, Soil 27, Carcass sites 26
+# 1 year:  Tissue 27, Soil 61, Carcass sites 29
+
+supp2_v2_raw_check <- supp2_v2_dat %>%
+  group_by(tsd_cat) %>%
+  summarise(
+    tissue_n = sum(sample_type == "Tissue"),
+    soil_n = sum(sample_type == "Soil"),
+    carcass_site_n = n_distinct(carcass_id),
+    culture_pos_n = sum(culture_pos, na.rm = TRUE),
+    culture_tested_n = sum(culture_tested, na.rm = TRUE),
+    pcr_pos_n = sum(pcr_pos, na.rm = TRUE),
+    pcr_tested_n = sum(pcr_tested, na.rm = TRUE),
+    any_pos_n = sum(any_pos, na.rm = TRUE),
+    any_tested_n = sum(any_tested, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(factor(
+    tsd_cat,
+    levels = c("0 years", "1 year", "2 years", "3 years", "5 years", "6 years", "Unknown")
+  ))
+
+supp2_v2_raw_check
+
+#-----------------------------
+# Denominators
+#-----------------------------
+
+total_tissue_samples <- sum(supp2_v2_dat$sample_type == "Tissue")
+total_soil_samples <- sum(supp2_v2_dat$sample_type == "Soil")
+total_carcass_sites <- n_distinct(supp2_v2_dat$carcass_id)
+
+total_culture_tested <- sum(supp2_v2_dat$culture_tested, na.rm = TRUE)
+total_pcr_tested <- sum(supp2_v2_dat$pcr_tested, na.rm = TRUE)
+total_any_tested <- sum(supp2_v2_dat$any_tested, na.rm = TRUE)
+
+#-----------------------------
+# Row shell
+#-----------------------------
+
+supp2_v2_rows <- tribble(
+  ~Variable, ~Category, ~category_column, ~soil_only,
+  
+  "Time Since Death", "0 years", "tsd_cat", FALSE,
+  "Time Since Death", "1 year", "tsd_cat", FALSE,
+  "Time Since Death", "2 years", "tsd_cat", FALSE,
+  "Time Since Death", "3 years", "tsd_cat", FALSE,
+  "Time Since Death", "5 years", "tsd_cat", FALSE,
+  "Time Since Death", "6 years", "tsd_cat", FALSE,
+  "Time Since Death", "Unknown", "tsd_cat", FALSE,
+  
+  "Year of Death", "2018", "death_year_cat", FALSE,
+  "Year of Death", "2021", "death_year_cat", FALSE,
+  "Year of Death", "2022", "death_year_cat", FALSE,
+  "Year of Death", "2023", "death_year_cat", FALSE,
+  "Year of Death", "2024", "death_year_cat", FALSE,
+  "Year of Death", "Unknown", "death_year_cat", FALSE,
+  
+  "Carcass Size", "Large", "carcass_size_cat", FALSE,
+  "Carcass Size", "Small", "carcass_size_cat", FALSE,
+  "Carcass Size", "Unknown", "carcass_size_cat", FALSE,
+  
+  "Habitat Moisture Class", "Dry", "habitat_moist_cat", FALSE,
+  "Habitat Moisture Class", "Medium", "habitat_moist_cat", FALSE,
+  "Habitat Moisture Class", "Unknown", "habitat_moist_cat", FALSE,
+  "Habitat Moisture Class", "Wet", "habitat_moist_cat", FALSE,
+  
+  "Soil Collection Distance", "0 m", "distance_cat", TRUE,
+  "Soil Collection Distance", "1 m", "distance_cat", TRUE,
+  "Soil Collection Distance", "3 m", "distance_cat", TRUE,
+  "Soil Collection Distance", "5 m", "distance_cat", TRUE,
+  "Soil Collection Distance", "15 m", "distance_cat", TRUE
+)
+
+#-----------------------------
+# Calculate each displayed row independently
+#-----------------------------
+
+calc_supp2_row <- function(Variable, Category, category_column, soil_only) {
+  
+  row_dat <- supp2_v2_dat
+  
+  if (soil_only) {
+    row_dat <- row_dat %>%
+      filter(sample_type == "Soil")
+  }
+  
+  row_dat <- row_dat %>%
+    filter(.data[[category_column]] == Category)
+  
+  tissue_n <- sum(row_dat$sample_type == "Tissue", na.rm = TRUE)
+  soil_n <- sum(row_dat$sample_type == "Soil", na.rm = TRUE)
+  carcass_site_n <- n_distinct(row_dat$carcass_id)
+  
+  culture_pos_n <- sum(row_dat$culture_pos, na.rm = TRUE)
+  culture_tested_n <- sum(row_dat$culture_tested, na.rm = TRUE)
+  
+  pcr_pos_n <- sum(row_dat$pcr_pos, na.rm = TRUE)
+  pcr_tested_n <- sum(row_dat$pcr_tested, na.rm = TRUE)
+  
+  any_pos_n <- sum(row_dat$any_pos, na.rm = TRUE)
+  any_tested_n <- sum(row_dat$any_tested, na.rm = TRUE)
+  
+  tibble(
+    Variable = Variable,
+    Category = Category,
+    `Tissue Samples, n (%)` = if (soil_only) "-" else fmt_n_pct(tissue_n, total_tissue_samples),
+    `Soil Samples, n (%)` = fmt_n_pct(soil_n, total_soil_samples),
+    `Carcass Sites, n (%)` = fmt_n_pct(carcass_site_n, total_carcass_sites),
+    `Culture + / n Tested (%)` = fmt_pos_tested(culture_pos_n, culture_tested_n),
+    `PCR + / n Tested (%)` = fmt_pos_tested(pcr_pos_n, pcr_tested_n),
+    `Any Test + / n Tested (%)` = fmt_pos_tested(any_pos_n, any_tested_n)
+  )
+}
+
+#-----------------------------
+# Final table
+#-----------------------------
+
+supp_table_2 <- pmap_dfr(
+  supp2_v2_rows,
+  calc_supp2_row
+) %>%
+  bind_rows(
+    tibble(
+      Variable = "",
+      Category = "TOTAL",
+      `Tissue Samples, n (%)` = fmt_total_n(total_tissue_samples),
+      `Soil Samples, n (%)` = fmt_total_n(total_soil_samples),
+      `Carcass Sites, n (%)` = fmt_total_n(total_carcass_sites),
+      `Culture + / n Tested (%)` = fmt_pos_tested(
+        sum(supp2_v2_dat$culture_pos, na.rm = TRUE),
+        total_culture_tested
+      ),
+      `PCR + / n Tested (%)` = fmt_pos_tested(
+        sum(supp2_v2_dat$pcr_pos, na.rm = TRUE),
+        total_pcr_tested
+      ),
+      `Any Test + / n Tested (%)` = fmt_pos_tested(
+        sum(supp2_v2_dat$any_pos, na.rm = TRUE),
+        total_any_tested
+      )
+    )
+  )
+
+supp_table_2
+
+#-----------------------------
+# Export
+#-----------------------------
+
+knitr::kable(
+  supp_table_2,
+  caption = "Supplementary Table 2. Summary of tissue and soil samples stratified by model covariates."
+)
+```
+
+## Delta Dataset Correlation Matrices
+```{r, Soil Chemistry: Delta Dataset Correlation Matrices, cache=FALSE}
+
+cor_pmat <- function(df, vars, method = "spearman") {
+  pmat <- matrix(NA_real_, nrow = length(vars), ncol = length(vars),
+                 dimnames = list(vars, vars))
+
+  for (i in seq_along(vars)) {
+    for (j in seq_along(vars)) {
+      x <- df[[vars[i]]]
+      y <- df[[vars[j]]]
+
+      keep <- complete.cases(x, y)
+
+      if (sum(keep) >= 3 &&
+          stats::sd(x[keep]) > 0 &&
+          stats::sd(y[keep]) > 0) {
+        pmat[i, j] <- suppressWarnings(
+          cor.test(x[keep], y[keep], method = method)$p.value
+        )
+      }
+    }
+  }
+
+  pmat
+}
+
+# Keep variables with enough observed data + nonzero variance
+delta_vars_abs_use <- delta_vars_abs[
+  sapply(soil_delta_tsd[delta_vars_abs], function(x) sum(!is.na(x)) >= 3 && sd(x, na.rm = TRUE) > 0)
+]
+
+delta_vars_pct_use <- delta_vars_pct[
+  sapply(soil_delta_tsd[delta_vars_pct], function(x) sum(!is.na(x)) >= 3 && sd(x, na.rm = TRUE) > 0)
+]
+
+# Absolute delta correlations
+delta_abs_cor <- cor(
+  soil_delta_tsd[, delta_vars_abs_use],
+  use = "pairwise.complete.obs",
+  method = "spearman"
+)
+
+delta_abs_p <- cor_pmat(
+  soil_delta_tsd,
+  vars = delta_vars_abs_use,
+  method = "spearman"
+)
+
+round(delta_abs_cor, 2)
+round(delta_abs_p, 3)
+
+# Percentage delta correlations
+delta_pct_cor <- cor(
+  soil_delta_tsd[, delta_vars_pct_use],
+  use = "pairwise.complete.obs",
+  method = "spearman"
+)
+
+delta_pct_p <- cor_pmat(
+  soil_delta_tsd,
+  vars = delta_vars_pct_use,
+  method = "spearman"
+)
+
+round(delta_pct_cor, 2)
+round(delta_pct_p, 3)
+
+plot_cor_heatmap <- function(cor_mat, p_mat = NULL, title = NULL) {
+
+  cor_df <- as.data.frame(as.table(cor_mat)) %>%
+    rename(
+      Var1 = Var1,
+      Var2 = Var2,
+      correlation = Freq
+    ) %>%
+    mutate(
+      Var1 = factor(Var1, levels = rownames(cor_mat)),
+      Var2 = factor(Var2, levels = rev(colnames(cor_mat)))
+    )
+
+  if (!is.null(p_mat)) {
+    p_df <- as.data.frame(as.table(p_mat)) %>%
+      rename(
+        Var1 = Var1,
+        Var2 = Var2,
+        p_value = Freq
+      ) %>%
+      mutate(
+        sig_lab = case_when(
+          is.na(p_value)      ~ "",
+          p_value < 0.001     ~ "***",
+          p_value < 0.01      ~ "**",
+          p_value < 0.05      ~ "*",
+          TRUE                ~ ""
+        )
+      )
+
+    cor_df <- cor_df %>%
+      left_join(p_df, by = c("Var1", "Var2"))
+  } else {
+    cor_df <- cor_df %>%
+      mutate(sig_lab = "")
+  }
+
+  ggplot(cor_df, aes(x = Var1, y = Var2, fill = correlation)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.2f%s", correlation, sig_lab)), size = 3) +
+    scale_fill_gradient2(
+      low = "#2166AC",
+      mid = "white",
+      high = "#B2182B",
+      midpoint = 0,
+      limits = c(-1, 1)
+    ) +
+    labs(
+      title = title,
+      x = NULL,
+      y = NULL,
+      fill = "r"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid = element_blank()
+    )
+}
+
+# Absolute delta heatmap
+p_delta_abs_cor <- plot_cor_heatmap(
+  cor_mat = delta_abs_cor,
+  p_mat   = delta_abs_p,
+  title   = "Absolute Delta Soil Chemistry Correlations"
+)
+
+p_delta_abs_cor
+
+# Percentage delta heatmap
+p_delta_pct_cor <- plot_cor_heatmap(
+  cor_mat = delta_pct_cor,
+  p_mat   = delta_pct_p,
+  title   = "Percentage Delta Soil Chemistry Correlations"
+)
+
+p_delta_pct_cor
+
+```
+
+## PERMANOVA Analyses WITHOUT Habitat Classes
+```{r, Soil Chemistry: PERMANOVA Analyses WITHOUT Habitat Classes, cache=FALSE}
+
+soil_perm4_tsd <- soil_chem_std %>%
+  filter(time_since_death_years %in% c(2, 3)) %>%
+  mutate(
+    years_since_death_f = factor(
+      paste0(time_since_death_years, "y"),
+      levels = c("2y", "3y")
+    ),
+    grp_tsd_dist = factor(
+      paste(years_since_death_f, distance_lab, sep = "_"),
+      levels = c("2y_0m", "2y_15m", "3y_0m", "3y_15m")
+    )
+  )
+
+soil_perm4_tsd %>% count(grp_tsd_dist)
+
+res_perm4_tsd <- run_perm_suite(
+  df         = soil_perm4_tsd,
+  group_var  = "grp_tsd_dist",
+  vars_z     = chem_vars_z,
+  strata_var = "carcass_id",
+  nperm      = 9999
+)
+
+res_perm4_tsd$permanova
+res_perm4_tsd$permdisp
+res_perm4_tsd$pairwise_permanova
+
+```
+
+## PERMANOVA Analyses WITH Habitat Classes
+```{r, Soil Chemistry: PERMANOVA Analyses WITH Habitat Classes, cache=FALSE}
+
+soil_perm12_tsd <- soil_chem_std %>%
+  filter(time_since_death_years %in% c(2, 3), !is.na(habitat_moist3)) %>%
+  mutate(
+    years_since_death_f = factor(
+      paste0(time_since_death_years, "y"),
+      levels = c("2y", "3y")
+    ),
+    grp_tsd_dist_hab = factor(
+      paste(years_since_death_f, distance_lab, habitat_moist3, sep = "_"),
+      levels = c(
+        "2y_0m_Dry", "2y_0m_Medium", "2y_0m_Wet",
+        "2y_15m_Dry", "2y_15m_Medium", "2y_15m_Wet",
+        "3y_0m_Dry", "3y_0m_Medium", "3y_0m_Wet",
+        "3y_15m_Dry", "3y_15m_Medium", "3y_15m_Wet"
+      )
+    ) %>% droplevels()
+  )
+
+soil_perm12_tsd %>% count(grp_tsd_dist_hab)
+
+res_perm12_tsd <- run_perm_suite(
+  df         = soil_perm12_tsd,
+  group_var  = "grp_tsd_dist_hab",
+  vars_z     = chem_vars_z,
+  strata_var = "carcass_id",
+  nperm      = 9999
+)
+
+res_perm12_tsd$permanova
+res_perm12_tsd$permdisp
+res_perm12_tsd$pairwise_permanova
+
+```
+
+## PERMANOVA Absolute Delta Dataset
+```{r, Soil Chemistry: PERMANOVA Absolute Delta Dataset, cache=FALSE}
+
+soil_delta_abs_std <- soil_delta_tsd %>%
+  drop_na(all_of(delta_vars_abs)) %>%
+  mutate(
+    across(all_of(delta_vars_abs), ~ as.numeric(scale(.x)), .names = "{.col}_z")
+  )
+
+delta_abs_z <- paste0(delta_vars_abs, "_z")
+
+# 2-group: 2y vs 3y
+res_perm_abs_tsd <- run_perm_suite(
+  df         = soil_delta_abs_std,
+  group_var  = "years_since_death_f",
+  vars_z     = delta_abs_z,
+  strata_var = "carcass_id",
+  nperm      = 9999
+)
+
+res_perm_abs_tsd$permanova
+res_perm_abs_tsd$permdisp
+
+# 6-group: 2y/3y x habitat
+soil_delta_abs_std <- soil_delta_abs_std %>%
+  filter(!is.na(habitat_moist3)) %>%
+  mutate(
+    grp_tsd_hab = factor(
+      paste(years_since_death_f, habitat_moist3, sep = "_"),
+      levels = c(
+        "2y_Dry", "2y_Medium", "2y_Wet",
+        "3y_Dry", "3y_Medium", "3y_Wet"
+      )
+    )
+  )
+
+res_perm_abs_tsd_hab <- run_perm_suite(
+  df         = soil_delta_abs_std,
+  group_var  = "grp_tsd_hab",
+  vars_z     = delta_abs_z,
+  strata_var = "carcass_id",
+  nperm      = 9999
+)
+
+res_perm_abs_tsd_hab$permanova
+res_perm_abs_tsd_hab$permdisp
+res_perm_abs_tsd_hab$pairwise_permanova
+
+```
+
+## PERMANOVA Percentage Delta Dataset
+```{r, Soil Chemistry: PERMANOVA Percentage Delta Dataset, cache=FALSE}
+
+soil_delta_pct_std <- soil_delta_tsd %>%
+  drop_na(all_of(delta_vars_pct)) %>%
+  mutate(
+    across(all_of(delta_vars_pct), ~ as.numeric(scale(.x)), .names = "{.col}_z")
+  )
+
+delta_pct_z <- paste0(delta_vars_pct, "_z")
+
+# 2-group: 2y vs 3y
+res_perm_pct_tsd <- run_perm_suite(
+  df         = soil_delta_pct_std,
+  group_var  = "years_since_death_f",
+  vars_z     = delta_pct_z,
+  strata_var = "carcass_id",
+  nperm      = 9999
+)
+
+res_perm_pct_tsd$permanova
+res_perm_pct_tsd$permdisp
+
+# 6-group: 2y/3y x habitat
+soil_delta_pct_std <- soil_delta_pct_std %>%
+  filter(!is.na(habitat_moist3)) %>%
+  mutate(
+    grp_tsd_hab = factor(
+      paste(years_since_death_f, habitat_moist3, sep = "_"),
+      levels = c(
+        "2y_Dry", "2y_Medium", "2y_Wet",
+        "3y_Dry", "3y_Medium", "3y_Wet"
+      )
+    )
+  )
+
+res_perm_pct_tsd_hab <- run_perm_suite(
+  df         = soil_delta_pct_std,
+  group_var  = "grp_tsd_hab",
+  vars_z     = delta_pct_z,
+  strata_var = "carcass_id",
+  nperm      = 9999
+)
+
+res_perm_pct_tsd_hab$permanova
+res_perm_pct_tsd_hab$permdisp
+res_perm_pct_tsd_hab$pairwise_permanova
+
+```
+
+## Paired Tests Delta Datasets
+```{r, Soil Chemistry: Paired Tests Delta Datasets, cache=FALSE}
+
+library(DT)
+
+mean_or_na <- function(x) {
+  if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+}
+
+sd_or_na <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) < 2) NA_real_ else sd(x)
+}
+
+mean_diff_ci <- function(diffs, conf.level = 0.95) {
+  diffs <- diffs[!is.na(diffs)]
+  n <- length(diffs)
+
+  if (n < 2) {
+    return(tibble(
+      mean_diff = ifelse(n == 1, mean(diffs), NA_real_),
+      diff_ci_low = NA_real_,
+      diff_ci_high = NA_real_
+    ))
+  }
+
+  md <- mean(diffs)
+  se <- sd(diffs) / sqrt(n)
+  tcrit <- qt(1 - (1 - conf.level) / 2, df = n - 1)
+
+  tibble(
+    mean_diff = md,
+    diff_ci_low = md - tcrit * se,
+    diff_ci_high = md + tcrit * se
+  )
+}
+
+run_paired_test_suite <- function(df, outcome_vars) {
+
+  purrr::map_dfr(outcome_vars, function(v) {
+
+    dwide <- df %>%
+      dplyr::select(carcass_id, years_since_death_f, dplyr::all_of(v)) %>%
+      dplyr::filter(years_since_death_f %in% c("2y", "3y")) %>%
+      dplyr::filter(!is.na(.data[[v]])) %>%
+      dplyr::distinct() %>%
+      tidyr::pivot_wider(
+        names_from = years_since_death_f,
+        values_from = dplyr::all_of(v)
+      ) %>%
+      tidyr::drop_na(`2y`, `3y`)
+
+    n_pairs <- nrow(dwide)
+
+    diffs <- if (n_pairs > 0) dwide$`3y` - dwide$`2y` else numeric(0)
+
+    ci_tbl <- mean_diff_ci(diffs)
+
+    out_base <- tibble(
+      variable = v,
+      n_pairs = n_pairs,
+
+      mean_2y = if (n_pairs > 0) mean(dwide$`2y`, na.rm = TRUE) else NA_real_,
+      sd_2y   = if (n_pairs > 0) sd_or_na(dwide$`2y`) else NA_real_,
+
+      mean_3y = if (n_pairs > 0) mean(dwide$`3y`, na.rm = TRUE) else NA_real_,
+      sd_3y   = if (n_pairs > 0) sd_or_na(dwide$`3y`) else NA_real_,
+
+      mean_diff_3y_minus_2y = ci_tbl$mean_diff,
+      diff_ci_low = ci_tbl$diff_ci_low,
+      diff_ci_high = ci_tbl$diff_ci_high
+    )
+
+    if (n_pairs < 3) {
+      return(
+        out_base %>%
+          dplyr::mutate(
+            normality_p = NA_real_,
+            test_used   = NA_character_,
+            statistic   = NA_real_,
+            p           = NA_real_
+          )
+      )
+    }
+
+    shapiro_p <- if (sd(diffs, na.rm = TRUE) > 0) {
+      shapiro.test(diffs)$p.value
+    } else {
+      NA_real_
+    }
+
+    if (!is.na(shapiro_p) && shapiro_p > 0.05) {
+      tt <- t.test(dwide$`3y`, dwide$`2y`, paired = TRUE)
+
+      out_base %>%
+        dplyr::mutate(
+          normality_p = shapiro_p,
+          test_used   = "Paired t-test",
+          statistic   = unname(tt$statistic),
+          p           = tt$p.value
+        )
+
+    } else {
+      wt <- wilcox.test(dwide$`3y`, dwide$`2y`, paired = TRUE, exact = FALSE)
+
+      out_base %>%
+        dplyr::mutate(
+          normality_p = shapiro_p,
+          test_used   = "Wilcoxon signed-rank",
+          statistic   = unname(wt$statistic),
+          p           = wt$p.value
+        )
+    }
+  }) %>%
+    dplyr::mutate(p_adj_BH = p.adjust(p, method = "BH")) %>%
+    dplyr::arrange(p_adj_BH, p)
+}
+
+paired_tests_abs <- run_paired_test_suite(
+  df = soil_delta_tsd,
+  outcome_vars = delta_vars_abs
+)
+
+paired_tests_pct <- run_paired_test_suite(
+  df = soil_delta_tsd,
+  outcome_vars = delta_vars_pct
+)
+
+DT::datatable(
+  paired_tests_abs,
+  options = list(pageLength = 25, scrollX = TRUE),
+  caption = "Paired 2y vs 3y tests: absolute delta dataset"
+)
+
+DT::datatable(
+  paired_tests_pct,
+  options = list(pageLength = 25, scrollX = TRUE),
+  caption = "Paired 2y vs 3y tests: percentage delta dataset"
+)
+
+```
+
+## Paired Tests, 0m vs 15m within 2y
+```{r, Soil Chemistry: Paired Tests, 0m vs 15m within 2y, cache=FALSE}
+
+mean_or_na <- function(x) {
+  if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+}
+
+run_paired_distance_tests_2y <- function(df, vars) {
+
+  wide_df <- df %>%
+    dplyr::filter(
+      time_since_death_years == 2,
+      distance_lab %in% c("0m", "15m")
+    ) %>%
+    dplyr::group_by(carcass_id, distance_lab) %>%
+    dplyr::summarise(
+      dplyr::across(dplyr::all_of(vars), mean_or_na),
+      .groups = "drop"
+    ) %>%
+    tidyr::pivot_wider(
+      names_from = distance_lab,
+      values_from = dplyr::all_of(vars),
+      names_glue = "{.value}_{distance_lab}"
+    )
+
+  purrr::map_dfr(vars, function(v) {
+
+    v0  <- paste0(v, "_0m")
+    v15 <- paste0(v, "_15m")
+
+    dsub <- wide_df %>%
+      dplyr::select(carcass_id, dplyr::all_of(c(v0, v15))) %>%
+      tidyr::drop_na()
+
+    n_pairs <- nrow(dsub)
+
+    diffs <- if (n_pairs > 0) dsub[[v0]] - dsub[[v15]] else numeric(0)
+
+    ci_tbl <- mean_diff_ci(diffs)
+
+    out_base <- tibble(
+      variable = v,
+      n_pairs = n_pairs,
+
+      mean_0m = if (n_pairs > 0) mean(dsub[[v0]], na.rm = TRUE) else NA_real_,
+      sd_0m   = if (n_pairs > 0) sd_or_na(dsub[[v0]]) else NA_real_,
+
+      mean_15m = if (n_pairs > 0) mean(dsub[[v15]], na.rm = TRUE) else NA_real_,
+      sd_15m   = if (n_pairs > 0) sd_or_na(dsub[[v15]]) else NA_real_,
+
+      mean_diff_0m_minus_15m = ci_tbl$mean_diff,
+      diff_ci_low = ci_tbl$diff_ci_low,
+      diff_ci_high = ci_tbl$diff_ci_high
+    )
+
+    if (n_pairs < 3) {
+      return(
+        out_base %>%
+          dplyr::mutate(
+            normality_p = NA_real_,
+            test_used = NA_character_,
+            statistic = NA_real_,
+            p = NA_real_
+          )
+      )
+    }
+
+    shapiro_p <- if (sd(diffs, na.rm = TRUE) > 0) {
+      shapiro.test(diffs)$p.value
+    } else {
+      NA_real_
+    }
+
+    if (!is.na(shapiro_p) && shapiro_p > 0.05) {
+      tt <- t.test(dsub[[v0]], dsub[[v15]], paired = TRUE)
+
+      out_base %>%
+        dplyr::mutate(
+          normality_p = shapiro_p,
+          test_used = "Paired t-test",
+          statistic = unname(tt$statistic),
+          p = tt$p.value
+        )
+
+    } else {
+      wt <- wilcox.test(dsub[[v0]], dsub[[v15]], paired = TRUE, exact = FALSE)
+
+      out_base %>%
+        dplyr::mutate(
+          normality_p = shapiro_p,
+          test_used = "Wilcoxon signed-rank",
+          statistic = unname(wt$statistic),
+          p = wt$p.value
+        )
+    }
+  }) %>%
+    dplyr::mutate(p_adj_BH = p.adjust(p, method = "BH")) %>%
+    dplyr::arrange(p_adj_BH, p)
+}
+
+paired_tests_2y_0m_vs_15m <- run_paired_distance_tests_2y(
+  df = soil_chem_tr,
+  vars = chem_vars_use
+)
+
+DT::datatable(
+  paired_tests_2y_0m_vs_15m,
+  options = list(pageLength = 25, scrollX = TRUE),
+  caption = "Paired 0m vs 15m tests within the 2-year-after-death cohort"
+)
+
+paired_tests_2y_0m_vs_15m %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  knitr::kable(
+    caption = "Paired 0m vs 15m tests within the 2-year-after-death cohort"
+  )
+```
+
+## GLMMs on Individual Delta Soil Properties
+```{r, Soil Chemistry: GLMMs on Individual Delta Soil Properties, cache=FALSE}
+
+library(lmerTest)
+library(broom.mixed)
+
+fit_delta_mixed_models <- function(df, outcome_vars) {
+
+  model_list <- map(outcome_vars, function(v) {
+
+    dsub <- df %>%
+      filter(
+        years_since_death_f %in% c("2y", "3y"),
+        !is.na(.data[[v]]),
+        !is.na(habitat_moist3),
+        !is.na(carcass_id)
+      ) %>%
+      droplevels()
+
+    if (nrow(dsub) < 6 || dplyr::n_distinct(dsub$carcass_id) < 3) {
+      return(list(
+        fit = NULL,
+        tidy = tibble(
+          variable = v,
+          term = NA_character_,
+          estimate = NA_real_,
+          std.error = NA_real_,
+          statistic = NA_real_,
+          p.value = NA_real_,
+          conf.low = NA_real_,
+          conf.high = NA_real_,
+          n_obs = nrow(dsub),
+          n_carcass = dplyr::n_distinct(dsub$carcass_id),
+          AIC = NA_real_
+        )
+      ))
+    }
+
+    form <- as.formula(
+      paste0(v, " ~ years_since_death_f + habitat_moist3 + (1 | carcass_id)")
+    )
+
+    fit <- glmmTMB(
+      formula = form,
+      data = dsub,
+      family = gaussian()
+    )
+
+    td <- broom.mixed::tidy(
+      fit,
+      effects = "fixed",
+      conf.int = TRUE
+    ) %>%
+      mutate(
+        variable = v,
+        n_obs = nrow(dsub),
+        n_carcass = dplyr::n_distinct(dsub$carcass_id),
+        AIC = AIC(fit)
+      ) %>%
+      select(variable, term, estimate, std.error, statistic, p.value,
+             conf.low, conf.high, n_obs, n_carcass, AIC)
+
+    list(fit = fit, tidy = td)
+  })
+
+  names(model_list) <- outcome_vars
+
+  tab <- bind_rows(map(model_list, "tidy"))
+
+  list(
+    models = model_list,
+    table = tab
+  )
+}
+
+abs_delta_model_fits <- fit_delta_mixed_models(
+  df = soil_delta_tsd,
+  outcome_vars = delta_vars_abs
+)
+
+pct_delta_model_fits <- fit_delta_mixed_models(
+  df = soil_delta_tsd,
+  outcome_vars = delta_vars_pct
+)
+
+abs_delta_model_fits$table
+pct_delta_model_fits$table
+
+knitr::kable(abs_delta_model_fits$table, digits = 3,
+             caption = "Time and Habitat mixed models: absolute delta dataset")
+knitr::kable(pct_delta_model_fits$table, digits = 3,
+             caption = "Time and Habitat mixed models: percentage delta dataset")
+
+### Habitat-Only Models ###
+
+fit_delta_habitat_models <- function(df, outcome_vars) {
+
+  model_list <- purrr::map(outcome_vars, function(v) {
+
+    dsub <- df %>%
+      filter(
+        !is.na(.data[[v]]),
+        !is.na(habitat_moist3),
+        !is.na(carcass_id)
+      ) %>%
+      droplevels()
+
+    if (nrow(dsub) < 6 || dplyr::n_distinct(dsub$carcass_id) < 3) {
+      return(list(
+        fit = NULL,
+        tidy = tibble::tibble(
+          variable = v,
+          term = NA_character_,
+          estimate = NA_real_,
+          std.error = NA_real_,
+          statistic = NA_real_,
+          p.value = NA_real_,
+          conf.low = NA_real_,
+          conf.high = NA_real_,
+          n_obs = nrow(dsub),
+          n_carcass = dplyr::n_distinct(dsub$carcass_id),
+          singular = NA
+        )
+      ))
+    }
+
+    form <- as.formula(
+      paste0(v, " ~ habitat_moist3 + (1 | carcass_id)")
+    )
+
+    fit <- lmerTest::lmer(
+      form,
+      data = dsub,
+      REML = FALSE,
+      control = lme4::lmerControl(
+        optimizer = "bobyqa",
+        optCtrl = list(maxfun = 1e5)
+      )
+    )
+
+    td <- broom.mixed::tidy(
+      fit,
+      effects = "fixed",
+      conf.int = TRUE
+    ) %>%
+      mutate(
+        variable = v,
+        n_obs = nrow(dsub),
+        n_carcass = dplyr::n_distinct(dsub$carcass_id),
+        singular = lme4::isSingular(fit, tol = 1e-4)
+      ) %>%
+      select(variable, term, estimate, std.error, statistic, p.value,
+             conf.low, conf.high, n_obs, n_carcass, singular)
+
+    list(fit = fit, tidy = td)
+  })
+
+  names(model_list) <- outcome_vars
+
+  list(
+    models = model_list,
+    table = bind_rows(purrr::map(model_list, "tidy"))
+  )
+}
+
+abs_hab_models <- fit_delta_habitat_models(
+  df = soil_delta_tsd,
+  outcome_vars = delta_vars_abs
+)
+
+pct_hab_models <- fit_delta_habitat_models(
+  df = soil_delta_tsd,
+  outcome_vars = delta_vars_pct
+)
+
+knitr::kable(abs_hab_models$table, digits = 3,
+             caption = "Habitat-only mixed models: absolute delta dataset")
+knitr::kable(pct_hab_models$table, digits = 3,
+             caption = "Habitat-only mixed models: percentage delta dataset")
+
+```
+
+
+## Soil Moisture Visualizations
+```{r, Soil Chemistry: Soil Moisture Visualizations, cache=FALSE}
+# Raw paired soil moisture: 0m and 15m shown separately
+soil_moist_raw_plot <- soil_chem_tr %>%
+  filter(
+    time_since_death_years %in% c(2, 3),
+    distance_lab %in% c("0m", "15m"),
+    !is.na(soil_moisture),
+    !is.na(habitat_moist3)
+  ) %>%
+  mutate(
+    years_since_death_f = factor(
+      paste0(time_since_death_years, "y"),
+      levels = c("2y", "3y")
+    )
+  )
+
+p_soil_moist_raw <- ggplot(
+  soil_moist_raw_plot,
+  aes(
+    x = habitat_moist3,
+    y = soil_moisture,
+    color = distance_lab,
+    shape = years_since_death_f
+  )
+) +
+  geom_point(
+    position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.65),
+    size = 2.7,
+    alpha = 0.85
+  ) +
+  stat_summary(
+    aes(group = distance_lab),
+    fun = median,
+    geom = "crossbar",
+    width = 0.45,
+    position = position_dodge(width = 0.65),
+    alpha = 0.6
+  ) +
+  labs(
+    title = "Raw soil moisture by habitat moisture class",
+    subtitle = "0m carcass-center and 15m paired-control soils shown separately",
+    x = "Habitat moisture class",
+    y = "Soil moisture",
+    color = "Distance",
+    shape = "Years since death"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+
+p_soil_moist_raw
+
+
+# Absolute and percentage delta soil moisture
+soil_moist_delta_plot <- soil_delta_tsd %>%
+  filter(!is.na(habitat_moist3)) %>%
+  select(
+    carcass_id,
+    years_since_death_f,
+    habitat_moist3,
+    delta_soil_moisture,
+    pct_delta_soil_moisture
+  ) %>%
+  pivot_longer(
+    cols = c(delta_soil_moisture, pct_delta_soil_moisture),
+    names_to = "delta_metric",
+    values_to = "soil_moisture_delta"
+  ) %>%
+  mutate(
+    delta_metric = recode(
+      delta_metric,
+      delta_soil_moisture = "Absolute delta: 0m - 15m",
+      pct_delta_soil_moisture = "Percentage delta: ((0m - 15m) / 15m) * 100"
+    )
+  )
+
+p_soil_moist_delta <- ggplot(
+  soil_moist_delta_plot,
+  aes(
+    x = habitat_moist3,
+    y = soil_moisture_delta,
+    color = years_since_death_f,
+    shape = years_since_death_f
+  )
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.6) +
+  geom_point(
+    position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.55),
+    size = 2.7,
+    alpha = 0.85
+  ) +
+  stat_summary(
+    aes(group = years_since_death_f),
+    fun = median,
+    geom = "crossbar",
+    width = 0.45,
+    position = position_dodge(width = 0.55),
+    alpha = 0.6
+  ) +
+  facet_wrap(~ delta_metric, scales = "free_y") +
+  labs(
+    title = "Carcass-associated soil moisture deltas by habitat moisture class",
+    subtitle = "Positive values indicate greater soil moisture at 0m than at 15m",
+    x = "Habitat moisture class",
+    y = "Soil moisture delta",
+    color = "Years since death",
+    shape = "Years since death"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+
+p_soil_moist_delta
+
+```
+
+
+## Soil Water Holding Capacity Visualizations
+```{r, Soil Chemistry: Soil Water Holding Capacity Visualizations, cache=FALSE}
+
+# Raw paired water holding capacity: 0m and 15m shown separately
+water_hold_raw_plot <- soil_chem_tr %>%
+  filter(
+    time_since_death_years %in% c(2, 3),
+    distance_lab %in% c("0m", "15m"),
+    !is.na(soil_water_hold_cap_log),
+    !is.na(habitat_moist3)
+  ) %>%
+  mutate(
+    years_since_death_f = factor(
+      paste0(time_since_death_years, "y"),
+      levels = c("2y", "3y")
+    )
+  )
+
+p_water_hold_raw <- ggplot(
+  water_hold_raw_plot,
+  aes(
+    x = habitat_moist3,
+    y = soil_water_hold_cap_log,
+    color = distance_lab,
+    shape = years_since_death_f
+  )
+) +
+  geom_point(
+    position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.65),
+    size = 2.7,
+    alpha = 0.85
+  ) +
+  stat_summary(
+    aes(group = distance_lab),
+    fun = median,
+    geom = "crossbar",
+    width = 0.45,
+    position = position_dodge(width = 0.65),
+    alpha = 0.6
+  ) +
+  labs(
+    title = "Raw water holding capacity by habitat moisture class",
+    subtitle = "0m carcass-center and 15m paired-control soils shown separately",
+    x = "Habitat moisture class",
+    y = "Water holding capacity, log-transformed",
+    color = "Distance",
+    shape = "Years since death"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+
+p_water_hold_raw
+
+
+# Absolute and percentage delta water holding capacity
+water_hold_delta_plot <- soil_delta_tsd %>%
+  filter(!is.na(habitat_moist3)) %>%
+  select(
+    carcass_id,
+    years_since_death_f,
+    habitat_moist3,
+    delta_soil_water_hold_cap_log,
+    pct_delta_soil_water_hold_cap_log
+  ) %>%
+  pivot_longer(
+    cols = c(delta_soil_water_hold_cap_log, pct_delta_soil_water_hold_cap_log),
+    names_to = "delta_metric",
+    values_to = "water_hold_delta"
+  ) %>%
+  mutate(
+    delta_metric = recode(
+      delta_metric,
+      delta_soil_water_hold_cap_log = "Absolute delta: 0m - 15m",
+      pct_delta_soil_water_hold_cap_log = "Percentage delta: ((0m - 15m) / 15m) * 100"
+    )
+  )
+
+p_water_hold_delta <- ggplot(
+  water_hold_delta_plot,
+  aes(
+    x = habitat_moist3,
+    y = water_hold_delta,
+    color = years_since_death_f,
+    shape = years_since_death_f
+  )
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.6) +
+  geom_point(
+    position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.55),
+    size = 2.7,
+    alpha = 0.85
+  ) +
+  stat_summary(
+    aes(group = years_since_death_f),
+    fun = median,
+    geom = "crossbar",
+    width = 0.45,
+    position = position_dodge(width = 0.55),
+    alpha = 0.6
+  ) +
+  facet_wrap(~ delta_metric, scales = "free_y") +
+  labs(
+    title = "Carcass-associated water holding capacity deltas by habitat moisture class",
+    subtitle = "Positive values indicate greater water holding capacity at 0m than at 15m",
+    x = "Habitat moisture class",
+    y = "Water holding capacity delta",
+    color = "Years since death",
+    shape = "Years since death"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+
+p_water_hold_delta
+
+```
+
+
+## LASSO and RIDGE Viability Models
+### Data Setup
+```{r, Soil Chemistry: Penalized Viability Models Setup, cache=FALSE}
+library(glmmLasso)
+library(hglm)
+
+first_nonmissing <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA else x[1]
+}
+
+mean_or_na <- function(x) {
+  if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+}
+
+scale_safe <- function(x) {
+  if (sum(!is.na(x)) < 2 || sd(x, na.rm = TRUE) == 0) {
+    rep(NA_real_, length(x))
+  } else {
+    as.numeric(scale(x))
+  }
+}
+
+# Rebuild raw soil chemistry viability dataset at the carcass-time-distance level
+# keeps 0m and 15m as separate observations
+soil_raw_viab <- soil_chem_tr %>%
+  filter(
+    time_since_death_years %in% c(2, 3),
+    distance_lab %in% c("0m", "15m")
+  ) %>%
+  mutate(
+    y_cult_row = case_when(
+      culture_done == "Y" & culture_ac_pos == "Y" ~ 1L,
+      culture_done == "Y" & culture_ac_pos != "Y" ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    years_since_death_f = factor(
+      paste0(time_since_death_years, "y"),
+      levels = c("2y", "3y")
+    ),
+    carcass_size = case_when(
+      as.character(carcass_size) %in% c("1", "Small") ~ "Small",
+      as.character(carcass_size) %in% c("2", "Large") ~ "Large",
+      TRUE ~ NA_character_
+    ),
+    carcass_size = factor(carcass_size, levels = c("Small", "Large")),
+    habitat_moist3 = factor(habitat_moist3, levels = c("Dry", "Medium", "Wet")),
+    distance_lab = factor(distance_lab, levels = c("0m", "15m"))
+  ) %>%
+  group_by(carcass_id, time_since_death_years, years_since_death_f, distance_lab) %>%
+  summarise(
+    y_cult = if_else(
+      any(!is.na(y_cult_row)),
+      as.integer(any(y_cult_row == 1, na.rm = TRUE)),
+      NA_integer_
+    ),
+    across(all_of(chem_vars_use), mean_or_na),
+    habitat_moist3 = first_nonmissing(habitat_moist3),
+    carcass_size = first_nonmissing(carcass_size),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    carcass_id = factor(carcass_id),
+    habitat_moist3 = factor(habitat_moist3, levels = c("Dry", "Medium", "Wet")),
+    carcass_size = factor(carcass_size, levels = c("Small", "Large")),
+    years_since_death_f = factor(years_since_death_f, levels = c("2y", "3y")),
+    distance_lab = factor(distance_lab, levels = c("0m", "15m"))
+  ) %>%
+  mutate(
+    across(all_of(chem_vars_use), scale_safe, .names = "{.col}_pen_z")
+  )
+
+raw_chem_pen_vars <- paste0(chem_vars_use, "_pen_z")
+
+# For delta datasets, use 0m viability as the outcome
+viab_0m <- soil_raw_viab %>%
+  filter(distance_lab == "0m") %>%
+  dplyr::select(
+    carcass_id,
+    time_since_death_years,
+    y_cult,
+    carcass_size
+  )
+
+soil_delta_viab <- soil_delta_tsd %>%
+  left_join(
+    viab_0m,
+    by = c("carcass_id", "time_since_death_years")
+  ) %>%
+  mutate(
+    carcass_id = factor(carcass_id),
+    habitat_moist3 = factor(habitat_moist3, levels = c("Dry", "Medium", "Wet")),
+    carcass_size = factor(carcass_size, levels = c("Small", "Large")),
+    years_since_death_f = factor(years_since_death_f, levels = c("2y", "3y"))
+  )
+
+# Standardized absolute delta predictors
+soil_delta_abs_viab <- soil_delta_viab %>%
+  mutate(
+    across(all_of(delta_vars_abs), scale_safe, .names = "{.col}_pen_z")
+  )
+
+delta_abs_pen_vars <- paste0(delta_vars_abs, "_pen_z")
+
+# Standardized percentage delta predictors
+soil_delta_pct_viab <- soil_delta_viab %>%
+  mutate(
+    across(all_of(delta_vars_pct), scale_safe, .names = "{.col}_pen_z")
+  )
+
+delta_pct_pen_vars <- paste0(delta_vars_pct, "_pen_z")
+
+#Balance checks
+check_viability_balance <- function(df, label) {
+  df %>%
+    summarise(
+      dataset = label,
+      n = n(),
+      n_carcass = n_distinct(carcass_id),
+      positives = sum(y_cult == 1, na.rm = TRUE),
+      negatives = sum(y_cult == 0, na.rm = TRUE),
+      missing_y = sum(is.na(y_cult))
+    )
+}
+
+bind_rows(
+  check_viability_balance(soil_raw_viab, "Raw standardized chemistry"),
+  check_viability_balance(soil_delta_abs_viab, "Absolute delta chemistry"),
+  check_viability_balance(soil_delta_pct_viab, "Percentage delta chemistry")
+) %>%
+  knitr::kable(caption = "Viability outcome balance for penalized regression datasets")
+```
+
+### Helper Functions
+```{r, Soil Chemistry: Penalized Viability Models Helper Functions, cache=FALSE}
+prep_pen_model_data <- function(df, outcome, predictors, group_var = "carcass_id") {
+
+  df2 <- df %>%
+    dplyr::select(all_of(c(outcome, group_var, predictors))) %>%
+    drop_na()
+
+  df2[[outcome]] <- as.integer(df2[[outcome]])
+  df2[[group_var]] <- factor(df2[[group_var]])
+
+  if (dplyr::n_distinct(df2[[outcome]]) < 2) {
+    stop("Outcome has fewer than two classes after filtering.")
+  }
+
+  df2
+}
+
+
+fit_glmmLasso_grid <- function(df,
+                               predictors,
+                               outcome = "y_cult",
+                               group_var = "carcass_id",
+                               lambda_grid = c(10, 25, 50, 100, 200, 500, 1000)) {
+
+  df2 <- prep_pen_model_data(
+    df = df,
+    outcome = outcome,
+    predictors = predictors,
+    group_var = group_var
+  )
+
+  fix_form <- stats::reformulate(predictors, response = outcome)
+
+  rnd_form <- list(~ 1)
+  names(rnd_form) <- group_var
+
+  grid_fits <- purrr::map_dfr(lambda_grid, function(lam) {
+
+    warning_messages <- character(0)
+
+    fit <- withCallingHandlers(
+      tryCatch(
+        glmmLasso::glmmLasso(
+          fix = fix_form,
+          rnd = rnd_form,
+          data = df2,
+          lambda = lam,
+          family = stats::binomial(link = "logit"),
+          switch.NR = TRUE,
+          final.re = FALSE,
+          control = list(
+            print.iter = FALSE,
+            print.iter.final = FALSE,
+            maxIter = 100,
+            maxIter.final = 100,
+            epsilon = 1e-4
+          )
+        ),
+        error = function(e) e
+      ),
+      warning = function(w) {
+        warning_messages <<- c(warning_messages, conditionMessage(w))
+        invokeRestart("muffleWarning")
+      }
+    )
+
+    if (inherits(fit, "error")) {
+      tibble::tibble(
+        lambda = lam,
+        aic = NA_real_,
+        bic = NA_real_,
+        conv_step = NA_real_,
+        n_selected = NA_integer_,
+        convergence_warning = TRUE,
+        warnings = conditionMessage(fit),
+        fit = list(NULL)
+      )
+    } else {
+
+      coefs <- as.numeric(fit$coefficients)
+      names(coefs) <- names(fit$coefficients)
+
+      tibble::tibble(
+        lambda = lam,
+        aic = as.numeric(fit$aic),
+        bic = as.numeric(fit$bic),
+        conv_step = as.numeric(fit$conv.step),
+        n_selected = sum(abs(coefs[names(coefs) != "(Intercept)"]) > 1e-6, na.rm = TRUE),
+        convergence_warning = any(grepl("did not converge|Algorithm did not converge|Fisher", warning_messages)),
+        warnings = paste(unique(warning_messages), collapse = " | "),
+        fit = list(fit)
+      )
+    }
+  })
+
+  valid_fits <- grid_fits %>%
+    dplyr::filter(!is.na(.data$bic))
+
+  if (nrow(valid_fits) == 0) {
+    stop("No glmmLasso models fit successfully across the lambda grid.")
+  }
+
+  # Prefer models without convergence warnings; if all warned, choose lowest BIC anyway
+  best_row <- valid_fits %>%
+    dplyr::arrange(.data$convergence_warning, .data$bic) %>%
+    dplyr::slice(1)
+
+  best_fit <- best_row$fit[[1]]
+
+  coef_table <- tibble::tibble(
+    term = names(best_fit$coefficients),
+    estimate = as.numeric(best_fit$coefficients)
+  ) %>%
+    dplyr::mutate(
+      selected = abs(.data$estimate) > 1e-6
+    ) %>%
+    dplyr::arrange(dplyr::desc(.data$selected), dplyr::desc(abs(.data$estimate)))
+
+  list(
+    data = df2,
+    grid = grid_fits %>% dplyr::select(-.data$fit),
+    best_lambda = best_row$lambda,
+    best_fit = best_fit,
+    coef_table = coef_table
+  )
+}
+
+
+fit_hglm_ridge <- function(df,
+                           predictors,
+                           outcome = "y_cult",
+                           group_var = "carcass_id") {
+
+  df2 <- prep_pen_model_data(
+    df = df,
+    outcome = outcome,
+    predictors = predictors,
+    group_var = group_var
+  )
+
+  # Fixed intercept only
+  X_fixed <- matrix(1, nrow = nrow(df2), ncol = 1)
+  colnames(X_fixed) <- "(Intercept)"
+
+  Z_carcass <- model.matrix(
+    reformulate(group_var, intercept = FALSE),
+    data = df2
+  )
+
+  Z_pred <- model.matrix(
+    reformulate(predictors),
+    data = df2
+  )
+
+  Z_pred <- Z_pred[, colnames(Z_pred) != "(Intercept)", drop = FALSE]
+
+  # Remove zero-variance predictor columns after dummy expansion
+  keep_cols <- apply(Z_pred, 2, function(z) sd(z, na.rm = TRUE) > 0)
+  Z_pred <- Z_pred[, keep_cols, drop = FALSE]
+
+  Z_all <- cbind(Z_carcass, Z_pred)
+
+  fit <- hglm::hglm(
+    X = X_fixed,
+    y = df2[[outcome]],
+    Z = Z_all,
+    family = binomial(link = "logit"),
+    rand.family = list(
+      gaussian(link = "identity"),
+      gaussian(link = "identity")
+    ),
+    RandC = c(ncol(Z_carcass), ncol(Z_pred)),
+    fix.disp = 1,
+    method = "EQL1",
+    maxit = 100,
+    sparse = TRUE,
+    calc.like = TRUE
+  )
+
+  ranef_vec <- as.numeric(fit$ranef)
+
+  ridge_coef <- tibble(
+    term = colnames(Z_pred),
+    ridge_estimate = tail(ranef_vec, ncol(Z_pred))
+  ) %>%
+    arrange(desc(abs(ridge_estimate)))
+
+  list(
+    data = df2,
+    fit = fit,
+    coef_table = ridge_coef,
+    convergence = fit$Converge,
+    var_components = fit$varRanef
+  )
+}
+
+
+summarise_penalized_results <- function(lasso_obj, ridge_obj, label) {
+
+  lasso_tbl <- lasso_obj$coef_table %>%
+    filter(term != "(Intercept)") %>%
+    transmute(
+      dataset = label,
+      term,
+      lasso_estimate = estimate,
+      lasso_selected = selected
+    )
+
+  ridge_tbl <- ridge_obj$coef_table %>%
+    transmute(
+      term,
+      ridge_estimate
+    )
+
+  full_join(lasso_tbl, ridge_tbl, by = "term") %>%
+    arrange(desc(lasso_selected), desc(abs(ridge_estimate)))
+}
+
+```
+
+### Models
+```{r, Soil Chemistry: Penalized Viability Models, cache=FALSE}
+
+# Raw chemistry model parameters
+raw_pen_predictors <- c(
+  raw_chem_pen_vars,
+  "habitat_moist3",
+  "years_since_death_f",
+  "carcass_size",
+  "distance_lab"
+)
+
+# Absolute delta model parameters
+abs_pen_predictors <- c(
+  delta_abs_pen_vars,
+  "habitat_moist3",
+  "years_since_death_f",
+  "carcass_size"
+)
+
+# Percentage delta model parameters
+pct_pen_predictors <- c(
+  delta_pct_pen_vars,
+  "habitat_moist3",
+  "years_since_death_f",
+  "carcass_size"
+)
+
+
+### Raw Chemistry Models ###
+
+raw_lasso <- fit_glmmLasso_grid(
+  df = soil_raw_viab,
+  predictors = raw_pen_predictors,
+  outcome = "y_cult",
+  group_var = "carcass_id"
+)
+
+raw_ridge <- fit_hglm_ridge(
+  df = soil_raw_viab,
+  predictors = raw_pen_predictors,
+  outcome = "y_cult",
+  group_var = "carcass_id"
+)
+
+raw_lasso$grid %>%
+  knitr::kable(digits = 3, caption = "glmmLASSO tuning grid: raw standardized chemistry")
+
+raw_pen_results <- summarise_penalized_results(
+  lasso_obj = raw_lasso,
+  ridge_obj = raw_ridge,
+  label = "Raw standardized chemistry"
+)
+
+DT::datatable(
+  raw_pen_results,
+  options = list(pageLength = 30, scrollX = TRUE),
+  caption = "Penalized viability model results: raw standardized chemistry"
+)
+
+
+### Absolute Delta Models ###
+
+abs_lasso <- fit_glmmLasso_grid(
+  df = soil_delta_abs_viab,
+  predictors = abs_pen_predictors,
+  outcome = "y_cult",
+  group_var = "carcass_id"
+)
+
+abs_ridge <- fit_hglm_ridge(
+  df = soil_delta_abs_viab,
+  predictors = abs_pen_predictors,
+  outcome = "y_cult",
+  group_var = "carcass_id"
+)
+
+abs_lasso$grid %>%
+  knitr::kable(digits = 3, caption = "glmmLASSO tuning grid: absolute delta chemistry")
+
+abs_pen_results <- summarise_penalized_results(
+  lasso_obj = abs_lasso,
+  ridge_obj = abs_ridge,
+  label = "Absolute delta chemistry"
+)
+
+DT::datatable(
+  abs_pen_results,
+  options = list(pageLength = 30, scrollX = TRUE),
+  caption = "Penalized viability model results: absolute delta chemistry"
+)
+
+
+### Percentage Delta Models ###
+
+pct_lasso <- fit_glmmLasso_grid(
+  df = soil_delta_pct_viab,
+  predictors = pct_pen_predictors,
+  outcome = "y_cult",
+  group_var = "carcass_id"
+)
+
+pct_ridge <- fit_hglm_ridge(
+  df = soil_delta_pct_viab,
+  predictors = pct_pen_predictors,
+  outcome = "y_cult",
+  group_var = "carcass_id"
+)
+
+pct_lasso$grid %>%
+  knitr::kable(digits = 3, caption = "glmmLASSO tuning grid: percentage delta chemistry")
+
+pct_pen_results <- summarise_penalized_results(
+  lasso_obj = pct_lasso,
+  ridge_obj = pct_ridge,
+  label = "Percentage delta chemistry"
+)
+
+DT::datatable(
+  pct_pen_results,
+  options = list(pageLength = 30, scrollX = TRUE),
+  caption = "Penalized viability model results: percentage delta chemistry"
+)
+
+
+### Comparsion Table ###
+
+penalized_viability_results <- bind_rows(
+  raw_pen_results,
+  abs_pen_results,
+  pct_pen_results
+)
+
+DT::datatable(
+  penalized_viability_results,
+  options = list(pageLength = 50, scrollX = TRUE),
+  caption = "Combined LASSO and RIDGE-style viability model comparison"
+)
+
+penalized_viability_results %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  knitr::kable(
+    caption = "Combined LASSO and RIDGE-style viability model comparison"
+  )
+```
+
+
+## Supp. Fig.: Soil Chemistry Ordination Plot
+```{r, Soil Chemistry: Ordination Plot, cache=FALSE}
+library(tidyverse)
+library(vegan)
+library(patchwork)
+
+dir.create("outputs", showWarnings = FALSE)
+
+# Variable Labels
+
+chem_var_labs <- c(
+  soil_moisture            = "Soil moisture",
+  soil_water_hold_cap_log  = "Water holding capacity",
+  soil_pH                  = "pH",
+  soil_soluble_C_log       = "Total soluble C",
+  soil_soluble_orgC_log    = "Soluble organic C",
+  soil_soluble_inorgC_log  = "Soluble inorganic C",
+  soil_N_log               = "Soluble N",
+  soil_CN_ratio_log        = "C:N ratio",
+  soil_Cl_log              = "Chloride",
+  soil_K_log               = "Potassium",
+  soil_P_log               = "Phosphorus"
+)
+
+# You can trim this list if the panel feels too busy.
+key_chem_vars <- c(
+  "soil_moisture",
+  "soil_water_hold_cap_log",
+  "soil_K_log",
+  "soil_P_log",
+  "soil_N_log",
+  "soil_soluble_C_log",
+  "soil_soluble_orgC_log",
+  "soil_soluble_inorgC_log",
+  "soil_CN_ratio_log",
+  "soil_Cl_log",
+  "soil_pH"
+)
+
+pretty_chem_var <- function(x) {
+  x2 <- x %>%
+    stringr::str_remove("^delta_") %>%
+    stringr::str_remove("^pct_delta_") %>%
+    stringr::str_remove("_pen_z$")
+
+  dplyr::recode(x2, !!!chem_var_labs, .default = x2)
+}
+
+
+# PCoA ordination
+
+pcoa_input <- soil_perm4_tsd %>%
+  filter(!is.na(grp_tsd_dist)) %>%
+  drop_na(all_of(chem_vars_z)) %>%
+  mutate(
+    years_since_death_f = factor(years_since_death_f, levels = c("2y", "3y")),
+    distance_lab = factor(distance_lab, levels = c("0m", "15m")),
+    grp_label = dplyr::recode(
+      as.character(grp_tsd_dist),
+      "2y_0m"  = "2y, 0 m",
+      "2y_15m" = "2y, 15 m",
+      "3y_0m"  = "3y, 0 m",
+      "3y_15m" = "3y, 15 m"
+    ),
+    grp_label = factor(grp_label, levels = c("2y, 0 m", "2y, 15 m", "3y, 0 m", "3y, 15 m"))
+  )
+
+pcoa_dist <- vegan::vegdist(
+  as.matrix(pcoa_input[, chem_vars_z]),
+  method = "euclidean"
+)
+
+pcoa_fit <- cmdscale(
+  pcoa_dist,
+  k = 2,
+  eig = TRUE
+)
+
+pcoa_var <- 100 * pcoa_fit$eig[1:2] / sum(pcoa_fit$eig[pcoa_fit$eig > 0])
+
+pcoa_scores <- pcoa_input %>%
+  bind_cols(
+    tibble(
+      PCoA1 = pcoa_fit$points[, 1],
+      PCoA2 = pcoa_fit$points[, 2]
+    )
+  )
+
+perm_r2 <- tryCatch(res_perm4_tsd$permanova$R2[1], error = function(e) NA_real_)
+perm_p  <- tryCatch(res_perm4_tsd$permanova$`Pr(>F)`[1], error = function(e) NA_real_)
+
+p_pcoa <- ggplot(
+  pcoa_scores,
+  aes(
+    x = PCoA1,
+    y = PCoA2,
+    color = grp_label,
+    shape = distance_lab
+  )
+) +
+  stat_ellipse(
+    aes(group = grp_label),
+    type = "norm",
+    level = 0.68,
+    linewidth = 0.5,
+    alpha = 0.55,
+    show.legend = FALSE
+  ) +
+  geom_point(size = 2.7, alpha = 0.9) +
+  labs(
+    title = "Soil chemistry profiles",
+    subtitle = paste0(
+      "PERMANOVA R² = ", round(perm_r2, 3),
+      "; p = ", format.pval(perm_p, digits = 2)
+    ),
+    x = paste0("PCoA1 (", round(pcoa_var[1], 1), "%)"),
+    y = paste0("PCoA2 (", round(pcoa_var[2], 1), "%)"),
+    color = "Group",
+    shape = "Distance"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+
+supp_fig_soil_chem_pcoa <- p_pcoa +
+  labs(
+    title = NULL,
+    subtitle = NULL
+    ) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    plot.caption = element_text(hjust = 0, size = 9)
+  )
+
+supp_fig_soil_chem_pcoa
+
+ggsave(
+  filename = "PCoA.png",
+  plot = supp_fig_soil_chem_pcoa,
+  width = 7,
+  height = 5.5,
+  dpi = 600
+)
+```
