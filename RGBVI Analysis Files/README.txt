@@ -7,7 +7,6 @@ The main purpose of this project component was to identify the distance of green
 ├── drone_photos/            # Drone images (contains JPG files)
 ├───── cor_brightness       # Drone images with radiometric calibration (contains TIF files)
 ├──────── rgbvi            # RGBVI images derived from the drone images with radiometric calibration (contains TIF files)
-├── figures/                 # Figures (contains JPEG files)
 ├── scripts/                 # R scripts necessary to generate the data (contains R files)
 ├───── study.R              # Main R code.
 ├───── theme_custom.R       # Settings for figure output in R. 
